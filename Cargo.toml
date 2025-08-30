@@ -1,0 +1,48 @@
+[package]
+name = "biasedrc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boxcar = "0.2"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
+
+[lints.rust]
+missing-docs = "warn"
+unsafe-op-in-unsafe-fn = "deny"
+
+[lints.clippy]
+## groups ##
+cargo = { priority = -1, level = "warn" }
+pedantic = { level = "warn", priority = -1 }
+
+# misc restrictions
+alloc_instead_of_core = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+redundant_test_prefix = "warn" # name test_foo is redundant with #[test] attr
+
+# safety
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+## aggressively lint casts ##
+# in an ideal world, overflowing casts would panic
+# linting them (with deny) is the second best option
+cast-possible-truncation = "deny"
+cast-possible-wrap = "deny"
+cast-precision-loss = "deny"
+cast-sign-loss = "deny"
+char-lit-as-u8 = "deny"
+cast-ptr-alignment = "deny"
+fn-to-numeric-cast = "deny"
+fn-to-numeric-cast-any = "deny"
+fn-to-numeric-cast-with-truncation = "deny"
+cast-lossless = "allow" # lossless casts are fine, lints will catch if types change
+ptr_as_ptr = "allow" # pointer casts are fine as long as they don't violate another rule
+
+
+# excessively pedantic (even for clippy::pedantic)
+too-many-lines = "allow"
+must-use-candidate = "allow"
