@@ -5,7 +5,7 @@ use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::Ordering;
-
+use arbitrary_int::prelude::*;
 use crate::raw::{BiasedWord, QueuedObject};
 
 #[derive(Copy, Clone, Debug)]
@@ -75,13 +75,33 @@ pub struct ThreadInfo {
     state: RwLock<LiveThreadState>,
 }
 impl ThreadInfo {
-    pub fn short_id(&self) -> Option<ShortThreadId> {}
+    #[inline]
+    pub fn short_id(&self) -> Option<ShortThreadId> {
+        self.short_id
+    }
     #[inline]
     pub fn current() -> Result<&'static ThreadInfo, InvalidThreadError> {
         THIS_THREAD
-            .try_with(|x| x.ok_or(InvalidThreadError::IdOverflow))
+            .try_with(|x| x.as_ref()
+                .map(|guard| guard.info)
+                .ok_or(InvalidThreadError::IdOverflow))
             .map_err(|_| InvalidThreadError::DeadOrDying)
             .flatten()
+    }
+
+    #[inline]
+    pub(crate) fn current_id() -> Result<ShortThreadId, InvalidThreadError> {
+        let current = Self::current()?;
+        // SAFETY: Will encounter InvalidThreadError if short_id is unchecked
+        Ok(unsafe { current.short_id().unwrap_unchecked() })
+
+    }
+
+    #[inline]
+    pub fn get_by_id(id: ShortThreadId) -> Option<&'static ThreadInfo> {
+        // SAFETY: Known to be nonzero, so subtraction will always work
+        let index = unsafe { id.0.get().unchecked_sub(1) };
+        THREADS.get(index as usize)
     }
 
     #[cold]
@@ -89,9 +109,9 @@ impl ThreadInfo {
         // don't do an upgradable_read here because that reduces concurrency
         let lock = self.state.read();
         let current_flag = self.state_flag.load(Ordering::Relaxed);
-        match *current_flag {
+        match current_flag {
             ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
-                let LiveThreadState::Live { ref queued_objects } = &*lock else {
+                let LiveThreadState::Live { queued_objects } = &*lock else {
                     unreachable!("flag doesn't match state")
                 };
                 queued_objects.push(object);
@@ -106,9 +126,17 @@ impl ThreadInfo {
                 drop(lock); // don't care if this unlock is fair
                 let lock = self.state.upgradable_read();
                 let current_flag = self.state_flag.load(Ordering::Relaxed);
-                match *current_flag {
-                    ThreadStateFlag::Dying => Err(InvalidThreadError::DeadOrDying),
+                match current_flag {
+                    ThreadStateFlag::Dying => {
+                        let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                        // SAFETY: We have been requested to destroy the info
+                        unsafe { self.do_destroy(&mut lock); }
+                        RwLockWriteGuard::unlock_fair(lock);
+                        // flag unchanged, so it is our responsibility to fix it
+                        Err(InvalidThreadError::DeadOrDying)
+                    },
                     ThreadStateFlag::Dead => {
+                        RwLockUpgradableReadGuard::unlock_fair(lock);
                         // someone else dealt with the death, so we are done
                         Err(InvalidThreadError::DeadOrDying)
                     }
@@ -118,7 +146,9 @@ impl ThreadInfo {
                         unreachable!("impossible to transition from dying to {current_flag:?}")
                     }
                 }
-            }
+            },
+            ThreadStateFlag::InvalidId => Err(InvalidThreadError::IdOverflow),
+            ThreadStateFlag::Dead => Err(InvalidThreadError::DeadOrDying),
         }
     }
 
@@ -128,24 +158,48 @@ impl ThreadInfo {
     /// The thread must actually be dead or dying,
     /// otherwise concurrent access to the biased counter will trigger undefined behavior.
     #[cold]
-    unsafe fn do_destroy(&self, lock: RwLockWriteGuard<'_, LiveThreadState>) {
-        match &mut *lock {
-            LiveThreadState::Live { queued_objects } => for object in queued_objects {},
+    unsafe fn do_destroy(&self, lock: &mut RwLockWriteGuard<'_, LiveThreadState>) {
+        let short_id = self.short_id.unwrap();
+        match &**lock {
+            LiveThreadState::Live { queued_objects } => {
+                while let Some(object) = queued_objects.pop() {
+                    // SAFETY: We are either the correct thread, or the
+                    unsafe { super::explicit_merge(short_id, object); }
+                }
+                self.state_flag.store(ThreadStateFlag::Dead, Ordering::Relaxed);
+                **lock = LiveThreadState::Dead;
+            },
             LiveThreadState::Dead => unreachable!("already dead"),
             LiveThreadState::InvalidId => unreachable!("invalid id"),
         }
     }
 }
 static HAS_QUEUED_OBJECTS: AtomicBool = AtomicBool::new(false);
+struct ThreadGuard {
+    info: &'static ThreadInfo,
+}
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        match self.info.state.try_write() {
+            Some(mut success) => {
+                // We are the owning thread
+                unsafe { self.info.do_destroy(&mut success); }
+            },
+            None => {
+                self.info.state_flag.store(ThreadStateFlag::Dying, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 thread_local! {
-    static THIS_THREAD: Option<&'static ThreadInfo> = init_thread();
+    static THIS_THREAD: Option<ThreadGuard> = init_thread();
 }
 /// If this is true, we have run out of valid thread ids.
 static THREAD_IDS_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 static THREADS: boxcar::Vec<ThreadInfo> = boxcar::Vec::new();
 
-fn init_thread() -> Option<&'static ThreadInfo> {
+fn init_thread() -> Option<ThreadGuard> {
     if THREAD_IDS_EXHAUSTED.load(Ordering::Acquire) {
         None
     } else {
@@ -156,19 +210,19 @@ fn init_thread() -> Option<&'static ThreadInfo> {
                     id,
                     short_id: Some(short_id),
                     state_flag: Atomic::new(ThreadStateFlag::Live),
-                    state: Mutex::new(LiveThreadState::Live {
-                        queued_objects: Vec::new(),
+                    state: RwLock::new(LiveThreadState::Live {
+                        queued_objects: Box::new(SegQueue::new()),
                     }),
                 },
                 Err(ThreadIdOverflowError) => ThreadInfo {
                     id,
                     short_id: None,
                     state_flag: Atomic::new(ThreadStateFlag::InvalidId),
-                    state: Mutex::new(LiveThreadState::InvalidId),
+                    state: RwLock::new(LiveThreadState::InvalidId),
                 },
             }
         });
-        Some(&THREADS[index])
+        Some(ThreadGuard { info: &THREADS[index] })
     }
 }
 
@@ -194,10 +248,10 @@ pub struct ThreadIdOverflowError;
 pub struct ShortThreadId(NonZeroU32);
 impl ShortThreadId {
     pub const BITS: u32 = 18;
-    pub const MAX: arbitrary_int::u18 = arbitrary_int::u18::MAX;
+    pub const MAX: u18 = u18::MAX;
 
     #[inline]
-    pub const fn new(x: arbitrary_int::u18) -> Option<Self> {
+    pub const fn new(x: u18) -> Option<Self> {
         // NOTE: Cannot use ? in const fn
         if x.value() != 0 {
             // SAFETY: Just checked to be nonzero
@@ -208,9 +262,9 @@ impl ShortThreadId {
     }
 
     #[inline]
-    pub const fn value(self) -> arbitrary_int::u18 {
+    pub const fn value(self) -> u18 {
         // SAFETY: Known to fit into 18 bits
-        unsafe { arbitrary_int::u18::new_unchecked(self.0.get()) }
+        unsafe { u18::new_unchecked(self.0.get()) }
     }
 }
 impl TryFrom<UniqueThreadId> for ShortThreadId {

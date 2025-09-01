@@ -11,6 +11,7 @@ parking_lot = "0.12"
 thiserror = "2"
 crossbeam-queue = "0.3"
 arbitrary-int = "2"
+ptr_meta = "0.3"
 
 [lints.rust]
 missing-docs = "warn"

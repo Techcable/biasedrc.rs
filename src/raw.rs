@@ -1,11 +1,9 @@
-use crate::raw::threads::ShortThreadId;
+use crate::raw::threads::{InvalidThreadError, ShortThreadId};
 use arbitrary_int::prelude::*;
 use core::marker::PhantomPinned;
 use core::sync::atomic::AtomicU32;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use threadid::LiveThreadId;
 
 mod threads;
 
@@ -35,7 +33,7 @@ impl RawBrcHeader {
     /// The resulting header must be pinned in-memory and never moved.
     #[inline]
     pub unsafe fn init() -> Self {
-        let this_id = self::threads::ThreadInfo::current().map_or(None, |x| x.short_id());
+        let this_id = threads::ThreadInfo::current_id().ok();
         match this_id {
             None => RawBrcHeader {
                 shared_word: AtomicU32::new(
@@ -47,13 +45,7 @@ impl RawBrcHeader {
                     }
                     .to_raw(),
                 ),
-                biased_word: AtomicU32::new(
-                    BiasedWord {
-                        owner_id: None,
-                        biased_count: u14::ZERO,
-                    }
-                    .to_raw(),
-                ),
+                biased_word: AtomicU32::new(BiasedWord::UNOWNED.to_raw()),
                 marker: PhantomPinned,
             },
             Some(this_id) => RawBrcHeader {
@@ -76,6 +68,7 @@ impl RawBrcHeader {
             },
         }
     }
+
     /// Increment the object's strong count.
     ///
     /// # Safety
@@ -94,14 +87,9 @@ impl RawBrcHeader {
             .biased_count
             .checked_add(u14::new(1))
             .ok_or(FastIncrementFailure)?;
-        let this_id = match self::threads::ThreadInfo::current() {
-            Ok(success) => {
-                // SAFETY: ThreadInfo::current will fail if short_id is None
-                unsafe { success.short_id().unwrap() }
-            }
-            Err(_) => return Err(FastIncrementFailure),
-        };
-        if biased_word.owner_id.is_some_and(|x| x == this_id) {
+        let this_id = self::threads::ThreadInfo::current_id()
+            .map_err(|_| FastIncrementFailure)?;
+        if biased_word.owner_id == Some(this_id) {
             self.biased_word.store(
                 BiasedWord {
                     biased_count: incremented_counter,
@@ -136,11 +124,129 @@ impl RawBrcHeader {
             })
             .unwrap();
     }
+
+
+    /// Decrement the object's strong count,
+    /// calling the specified destructor function on failure.
+    ///
+    /// # Safety
+    /// Once a header is destroyed, it should never be used again.
+    ///
+    /// Undefined behavior if not correctly paired with [`Self::increment_strong`].
+    #[inline]
+    pub unsafe fn decrement_strong<D: DestructorFunc>(&self) {
+
+    }
+
+    #[inline]
+    unsafe fn fast_decrement<D: DestructorFunc>(&self) -> Result<(), FastDecrementFailure> {
+        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+        let this_id = threads::ThreadInfo::current_id()
+            .map_err(|_| FastDecrementFailure)?;
+        if Some(this_id) == biased_word.owner_id {
+            debug_assert_ne!(biased_word.biased_count.value(), 0);
+            // SAFETY: Caller guarantees that refcnt > 0
+            let biased_count = unsafe {
+                u14::new_unchecked(biased_word.biased_count.value().unchecked_sub(1))
+            };
+            if biased_count.value() > 0 {
+                Ok(())
+            } else {
+                unsafe { self.fast_decrement_slow::<D>(); }
+                Ok(())
+            }
+        } else {
+            Err(FastDecrementFailure)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn fast_decrement_slow<D: DestructorFunc>(&self) {
+        let new = SharedWord::from_raw(self.shared_word.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+            let old = SharedWord::from_raw(old);
+            debug_assert!(!old.merged);
+            Some(SharedWord {
+                merged: old.merged,
+                ..old
+            }.to_raw())
+        }).unwrap());
+        debug_assert!(new.shared_count.value() >= 0);
+        if new.shared_count.value() == 0 {
+            // SAFETY: The pointer is valid, and it is time to deallocate
+            unsafe { D::dealloc(NonNull::from(self)) }
+        } else {
+            // release ownership
+            self.biased_word.store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn slow_decrement<D: DestructorFunc>(&self) {
+        let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
+        let mut new: SharedWord;
+        loop {
+            new = SharedWord {
+                shared_count: old.shared_count.checked_sub(i30::new(1))
+                    .expect("refcnt underflow"),
+                ..old
+            };
+            if new.shared_count.value() < 0 {
+                new.queued = true;
+            }
+            match self.shared_word.compare_exchange_weak(old.to_raw(), new.to_raw(), Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(x) => {
+                    old = SharedWord::from_raw(x)
+                },
+            }
+        }
+        debug_assert!(!new.merged || new.shared_count.value() >= 0);
+        if old.queued != new.queued {
+            let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+            let owner_id = biased_word.owner_id
+                .expect("due to negative refcnt, must have owner");
+            // SAFETY: Queued object is
+            match unsafe { threads::ThreadInfo::get_by_id(owner_id)
+                .expect("owner thread info is undefined")
+                .queue_object(QueuedObject {
+                    ptr: NonNull::from(self),
+                    drop: D::dealloc,
+                }) }{
+                Ok(()) => {},
+                Err(InvalidThreadError::IdOverflow) => unreachable!(),
+                Err(InvalidThreadError::DeadOrDying) => {
+                    // SAFETY: Since thread is dead, we can do the explicit merge
+                    unsafe { self::explicit_merge(owner_id, QueuedObject {
+                        ptr: NonNull::from(self),
+                        drop: D::dealloc,
+                    }) }
+                }
+            }
+        } else if new.merged && new.shared_count.value() == 0 {
+            // SAFETY: Valid to deallocate
+            unsafe {
+                D::dealloc(NonNull::from(self));
+            }
+        }
+    }
 }
+
 unsafe impl Send for RawBrcHeader {}
 unsafe impl Sync for RawBrcHeader {}
 #[derive(Debug)]
 struct FastIncrementFailure;
+#[derive(Debug)]
+struct FastDecrementFailure;
+
+/// A deallocation function.
+///
+/// This is functionally equivalent to an `unsafe fn(*mut RawBrcHeader)`,
+/// but is its own trait so that it gets monomorphized.
+pub trait DestructorFunc: Copy {
+    unsafe fn dealloc(&self, ptr: NonNull<RawBrcHeader>);
+}
 
 #[derive(Copy, Clone, Debug)]
 struct BiasedWord {
@@ -148,10 +254,14 @@ struct BiasedWord {
     biased_count: u14,
 }
 impl BiasedWord {
+    const UNOWNED: BiasedWord = BiasedWord {
+        owner_id: None,
+        biased_count: u14::ZERO,
+    };
     #[inline]
     fn to_raw(&self) -> u32 {
         (self.biased_count.value() as u32)
-            | (self.owner_id.map_or(0, ShortThreadId::value) << ShortThreadId::BITS)
+            | (self.owner_id.map_or(0, |value| value.value().value()) << ShortThreadId::BITS)
     }
     #[inline]
     fn from_raw(raw: u32) -> Self {
@@ -191,6 +301,7 @@ struct QueuedObject {
 unsafe impl Send for QueuedObject {}
 unsafe impl Sync for QueuedObject {}
 
+#[cold]
 pub(crate) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObject) {
     // SAFETY: Validity guaranteed by caller
     let header = unsafe { object.ptr.as_ref() };
@@ -203,7 +314,7 @@ pub(crate) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
         .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old_word| {
             let old_word = SharedWord::from_raw(old_word);
             assert!(!old_word.merged);
-            let biased_count = arbitrary_int::i30::from(biased.biased_count);
+            let biased_count = i30::from(biased.biased_count.value());
             Some(
                 SharedWord {
                     shared_count: old_word
