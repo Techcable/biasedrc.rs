@@ -2,11 +2,11 @@
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 
+use ptr_meta::{DynMetadata, Pointee};
 use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use ptr_meta::{DynMetadata, Pointee};
 
 mod raw;
 
@@ -46,4 +46,3 @@ impl<T: ?Sized + SupportedPointerTarget> Drop for Brc<T> {
         unsafe { self.header().decrement_strong::<DestructorFunction<T>>() }
     }
 }
-

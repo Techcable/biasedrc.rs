@@ -87,8 +87,7 @@ impl RawBrcHeader {
             .biased_count
             .checked_add(u14::new(1))
             .ok_or(FastIncrementFailure)?;
-        let this_id = self::threads::ThreadInfo::current_id()
-            .map_err(|_| FastIncrementFailure)?;
+        let this_id = self::threads::ThreadInfo::current_id().map_err(|_| FastIncrementFailure)?;
         if biased_word.owner_id == Some(this_id) {
             self.biased_word.store(
                 BiasedWord {
@@ -125,7 +124,6 @@ impl RawBrcHeader {
             .unwrap();
     }
 
-
     /// Decrement the object's strong count,
     /// calling the specified destructor function on failure.
     ///
@@ -134,25 +132,23 @@ impl RawBrcHeader {
     ///
     /// Undefined behavior if not correctly paired with [`Self::increment_strong`].
     #[inline]
-    pub unsafe fn decrement_strong<D: DestructorFunc>(&self) {
-
-    }
+    pub unsafe fn decrement_strong<D: DestructorFunc>(&self) {}
 
     #[inline]
     unsafe fn fast_decrement<D: DestructorFunc>(&self) -> Result<(), FastDecrementFailure> {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
-        let this_id = threads::ThreadInfo::current_id()
-            .map_err(|_| FastDecrementFailure)?;
+        let this_id = threads::ThreadInfo::current_id().map_err(|_| FastDecrementFailure)?;
         if Some(this_id) == biased_word.owner_id {
             debug_assert_ne!(biased_word.biased_count.value(), 0);
             // SAFETY: Caller guarantees that refcnt > 0
-            let biased_count = unsafe {
-                u14::new_unchecked(biased_word.biased_count.value().unchecked_sub(1))
-            };
+            let biased_count =
+                unsafe { u14::new_unchecked(biased_word.biased_count.value().unchecked_sub(1)) };
             if biased_count.value() > 0 {
                 Ok(())
             } else {
-                unsafe { self.fast_decrement_slow::<D>(); }
+                unsafe {
+                    self.fast_decrement_slow::<D>();
+                }
                 Ok(())
             }
         } else {
@@ -163,21 +159,29 @@ impl RawBrcHeader {
     #[cold]
     #[inline(never)]
     unsafe fn fast_decrement_slow<D: DestructorFunc>(&self) {
-        let new = SharedWord::from_raw(self.shared_word.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-            let old = SharedWord::from_raw(old);
-            debug_assert!(!old.merged);
-            Some(SharedWord {
-                merged: old.merged,
-                ..old
-            }.to_raw())
-        }).unwrap());
+        let new = SharedWord::from_raw(
+            self.shared_word
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+                    let old = SharedWord::from_raw(old);
+                    debug_assert!(!old.merged);
+                    Some(
+                        SharedWord {
+                            merged: old.merged,
+                            ..old
+                        }
+                        .to_raw(),
+                    )
+                })
+                .unwrap(),
+        );
         debug_assert!(new.shared_count.value() >= 0);
         if new.shared_count.value() == 0 {
             // SAFETY: The pointer is valid, and it is time to deallocate
             unsafe { D::dealloc(NonNull::from(self)) }
         } else {
             // release ownership
-            self.biased_word.store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+            self.biased_word
+                .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
         }
     }
 
@@ -188,40 +192,53 @@ impl RawBrcHeader {
         let mut new: SharedWord;
         loop {
             new = SharedWord {
-                shared_count: old.shared_count.checked_sub(i30::new(1))
+                shared_count: old
+                    .shared_count
+                    .checked_sub(i30::new(1))
                     .expect("refcnt underflow"),
                 ..old
             };
             if new.shared_count.value() < 0 {
                 new.queued = true;
             }
-            match self.shared_word.compare_exchange_weak(old.to_raw(), new.to_raw(), Ordering::AcqRel, Ordering::Relaxed) {
+            match self.shared_word.compare_exchange_weak(
+                old.to_raw(),
+                new.to_raw(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
-                Err(x) => {
-                    old = SharedWord::from_raw(x)
-                },
+                Err(x) => old = SharedWord::from_raw(x),
             }
         }
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
             let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
-            let owner_id = biased_word.owner_id
+            let owner_id = biased_word
+                .owner_id
                 .expect("due to negative refcnt, must have owner");
             // SAFETY: Queued object is
-            match unsafe { threads::ThreadInfo::get_by_id(owner_id)
-                .expect("owner thread info is undefined")
-                .queue_object(QueuedObject {
-                    ptr: NonNull::from(self),
-                    drop: D::dealloc,
-                }) }{
-                Ok(()) => {},
+            match unsafe {
+                threads::ThreadInfo::get_by_id(owner_id)
+                    .expect("owner thread info is undefined")
+                    .queue_object(QueuedObject {
+                        ptr: NonNull::from(self),
+                        drop: D::dealloc,
+                    })
+            } {
+                Ok(()) => {}
                 Err(InvalidThreadError::IdOverflow) => unreachable!(),
                 Err(InvalidThreadError::DeadOrDying) => {
                     // SAFETY: Since thread is dead, we can do the explicit merge
-                    unsafe { self::explicit_merge(owner_id, QueuedObject {
-                        ptr: NonNull::from(self),
-                        drop: D::dealloc,
-                    }) }
+                    unsafe {
+                        self::explicit_merge(
+                            owner_id,
+                            QueuedObject {
+                                ptr: NonNull::from(self),
+                                drop: D::dealloc,
+                            },
+                        )
+                    }
                 }
             }
         } else if new.merged && new.shared_count.value() == 0 {

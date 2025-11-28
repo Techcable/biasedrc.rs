@@ -1,3 +1,5 @@
+use crate::raw::{BiasedWord, QueuedObject};
+use arbitrary_int::prelude::*;
 use atomic::Atomic;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
@@ -5,8 +7,6 @@ use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::Ordering;
-use arbitrary_int::prelude::*;
-use crate::raw::{BiasedWord, QueuedObject};
 
 #[derive(Copy, Clone, Debug)]
 #[repr(transparent)]
@@ -82,9 +82,11 @@ impl ThreadInfo {
     #[inline]
     pub fn current() -> Result<&'static ThreadInfo, InvalidThreadError> {
         THIS_THREAD
-            .try_with(|x| x.as_ref()
-                .map(|guard| guard.info)
-                .ok_or(InvalidThreadError::IdOverflow))
+            .try_with(|x| {
+                x.as_ref()
+                    .map(|guard| guard.info)
+                    .ok_or(InvalidThreadError::IdOverflow)
+            })
             .map_err(|_| InvalidThreadError::DeadOrDying)
             .flatten()
     }
@@ -94,7 +96,6 @@ impl ThreadInfo {
         let current = Self::current()?;
         // SAFETY: Will encounter InvalidThreadError if short_id is unchecked
         Ok(unsafe { current.short_id().unwrap_unchecked() })
-
     }
 
     #[inline]
@@ -130,11 +131,13 @@ impl ThreadInfo {
                     ThreadStateFlag::Dying => {
                         let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
                         // SAFETY: We have been requested to destroy the info
-                        unsafe { self.do_destroy(&mut lock); }
+                        unsafe {
+                            self.do_destroy(&mut lock);
+                        }
                         RwLockWriteGuard::unlock_fair(lock);
                         // flag unchanged, so it is our responsibility to fix it
                         Err(InvalidThreadError::DeadOrDying)
-                    },
+                    }
                     ThreadStateFlag::Dead => {
                         RwLockUpgradableReadGuard::unlock_fair(lock);
                         // someone else dealt with the death, so we are done
@@ -146,7 +149,7 @@ impl ThreadInfo {
                         unreachable!("impossible to transition from dying to {current_flag:?}")
                     }
                 }
-            },
+            }
             ThreadStateFlag::InvalidId => Err(InvalidThreadError::IdOverflow),
             ThreadStateFlag::Dead => Err(InvalidThreadError::DeadOrDying),
         }
@@ -164,11 +167,14 @@ impl ThreadInfo {
             LiveThreadState::Live { queued_objects } => {
                 while let Some(object) = queued_objects.pop() {
                     // SAFETY: We are either the correct thread, or the
-                    unsafe { super::explicit_merge(short_id, object); }
+                    unsafe {
+                        super::explicit_merge(short_id, object);
+                    }
                 }
-                self.state_flag.store(ThreadStateFlag::Dead, Ordering::Relaxed);
+                self.state_flag
+                    .store(ThreadStateFlag::Dead, Ordering::Relaxed);
                 **lock = LiveThreadState::Dead;
-            },
+            }
             LiveThreadState::Dead => unreachable!("already dead"),
             LiveThreadState::InvalidId => unreachable!("invalid id"),
         }
@@ -183,10 +189,14 @@ impl Drop for ThreadGuard {
         match self.info.state.try_write() {
             Some(mut success) => {
                 // We are the owning thread
-                unsafe { self.info.do_destroy(&mut success); }
-            },
+                unsafe {
+                    self.info.do_destroy(&mut success);
+                }
+            }
             None => {
-                self.info.state_flag.store(ThreadStateFlag::Dying, Ordering::Relaxed);
+                self.info
+                    .state_flag
+                    .store(ThreadStateFlag::Dying, Ordering::Relaxed);
             }
         }
     }
@@ -222,7 +232,9 @@ fn init_thread() -> Option<ThreadGuard> {
                 },
             }
         });
-        Some(ThreadGuard { info: &THREADS[index] })
+        Some(ThreadGuard {
+            info: &THREADS[index],
+        })
     }
 }
 
