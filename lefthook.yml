@@ -1,0 +1,34 @@
+skip_output:
+  - meta
+  - success
+  - summary
+# most commands are run through 'uv run' to get a consistent version
+# this costs ~10ms each
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      tags: formatter
+      # cargo assumed to be correct version, controlled via rustup
+      run: cargo fmt --check
+    taplo:
+      tags: formatter
+      glob: "*.toml"
+      # No need to --force-exclude for taplo
+      run: taplo format --check -- {staged_files}
+      env:
+        # without this, taplo is very verbose
+        RUST_LOG: warn
+    typos:
+      tags: spellcheck
+      run: uvx typos@1.38 --force-exclude --format=brief -- {staged_files}
+# takes one parameter - the file with the proposed commit message
+# access through lefthook with `{1}`
+#
+# If this hook fails, a backup of the commit message is saved in .git/
+commit-msg:
+  commands:
+    typos-commit:
+      tags: spellcheck
+      run: typos -- {1}
+

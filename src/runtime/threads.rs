@@ -383,7 +383,7 @@ pub enum InvalidSharedThreadError {
 )]
 pub struct ThreadIdOverflowError;
 
-/// Indicates an error occurred calling [`LocalThreadState::with_curernt`]
+/// Indicates an error occurred calling [`LocalThreadState::with_current`]
 /// or [`LocalThreadState::existing_short_id`].
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 pub enum LocalThreadAccessError {

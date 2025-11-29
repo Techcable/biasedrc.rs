@@ -1,0 +1,7 @@
+[formatting]
+indent_string = "    "
+array_auto_collapse = false
+column_width = 120
+# this tries to line up comments after entries in a nice little table
+# these sorts of ASCII tables are far too fragile for my taste
+align_comments = false

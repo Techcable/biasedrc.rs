@@ -1,0 +1,5 @@
+[files]
+ignore-hidden = false
+extend-exclude = [
+    ".git", # needed because we 'ignore-hidden'
+]

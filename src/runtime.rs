@@ -13,7 +13,7 @@ mod threads;
 
 /// The object header for a [`Brc`].
 ///
-/// Seperated from the [`Brc`] to allow more detailed control of allocation.
+/// Separated from the [`Brc`] to allow more detailed control of allocation.
 ///
 /// # Safety
 /// Calling [`Self::decrement_strong`] incorrectly can lead to use-after-free.
@@ -36,7 +36,7 @@ impl RawBrcHeader {
     #[inline]
     pub unsafe fn init() -> Self {
         // Cannot use LocalThreadState::existing_short_id,
-        // because the thread state may not exist and we want to initalize it.
+        // because the thread state may not exist and we want to initialize it.
         let this_id = LocalThreadState::with_current(LocalThreadState::short_id).ok();
         match this_id {
             None => RawBrcHeader {
@@ -177,7 +177,7 @@ impl RawBrcHeader {
                 unsafe { core::hint::unreachable_unchecked() }
             }
             Err(LocalThreadAccessError::Dead) => {
-                // we can encounter a dead thread even after succesfull initialization,
+                // we can encounter a dead thread even after successful initialization,
                 // so we still need to check for that
                 return Err(FastDecrementFailure);
             }
