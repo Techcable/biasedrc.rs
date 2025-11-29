@@ -5,7 +5,7 @@ use arbitrary_int::prelude::*;
 use core::marker::PhantomPinned;
 use core::sync::atomic::AtomicU32;
 use std::ffi::c_void;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 
@@ -84,11 +84,13 @@ impl RawBrcHeader {
     /// This is a safe operation for the same reason that [`std::mem::forget`] is.
     #[inline]
     pub fn increment_strong(&self) {
+        eprintln!("increment_strong(start): {self:#?}");
         nounwind::abort_unwind(|| {
             if self.attempt_fast_increment().is_err() {
                 self.slow_increment();
             }
         });
+        eprintln!("increment_strong(end): {self:#?}");
     }
 
     #[inline]
@@ -143,8 +145,7 @@ impl RawBrcHeader {
     ///
     /// It can also panic if the internal state is corrupted in some way.
     /// However, this behavior is not guaranteed.
-    /// In the future, this may trigger an abort.
-    ///
+    /// In the future, internal errors may trigger an abort instead.
     ///
     /// # Safety
     /// Once a header is destroyed, it should never be used again.
@@ -154,6 +155,7 @@ impl RawBrcHeader {
     /// which allows skipping some initialization checks.
     #[inline]
     pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) {
+        eprintln!("decrement_strong(start): {self:#?}");
         // SAFETY: Caller guarantees drop function is valid and RC is owned
         match unsafe { self.fast_decrement(drop) } {
             Ok(()) => {} // nothing more to do
@@ -170,24 +172,32 @@ impl RawBrcHeader {
         let owner_id = biased_word.owner_id.ok_or(FastDecrementFailure)?;
         let this_id = match LocalThreadState::existing_short_id() {
             Ok(short_id) => short_id,
-            Err(LocalThreadAccessError::Uninitialized | LocalThreadAccessError::IdOverflow(_)) => {
-                // SAFETY: these two states cannot be encountered,
-                // as we know Self::init has been run and `owner_id` is not `None`.
-                // This guarantees that the biased thread must be initialized
-                unsafe { core::hint::unreachable_unchecked() }
-            }
-            Err(LocalThreadAccessError::Dead) => {
-                // we can encounter a dead thread even after successful initialization,
-                // so we still need to check for that
+            Err(
+                LocalThreadAccessError::Uninitialized
+                | LocalThreadAccessError::IdOverflow(_)
+                | LocalThreadAccessError::Dead,
+            ) => {
+                // if this thread has not been initialized,
+                // then we obviously cannot own the biased counter
                 return Err(FastDecrementFailure);
             }
         };
         if this_id == owner_id {
             debug_assert_ne!(biased_word.biased_count.value(), 0);
             // SAFETY: Caller guarantees that refcnt > 0
-            let biased_count =
+            let new_biased_count =
                 unsafe { u14::new_unchecked(biased_word.biased_count.value().unchecked_sub(1)) };
-            if biased_count.value() > 0 {
+            // can just update the reference count
+            if new_biased_count.value() > 0 {
+                // store updated reference count
+                self.biased_word.store(
+                    BiasedWord {
+                        biased_count: new_biased_count,
+                        ..biased_word
+                    }
+                    .to_raw(),
+                    Ordering::Relaxed,
+                );
                 Ok(())
             } else {
                 // SAFETY: We have already verified that we are the biased thread
@@ -231,7 +241,7 @@ impl RawBrcHeader {
         if new.shared_count.value() == 0 {
             let header_ptr = NonNull::from(self);
             // SAFETY: The pointer is valid, and it is time to deallocate
-            unsafe { drop.dealloc_header(header_ptr) }
+            unsafe { drop.dealloc(header_ptr) }
         } else {
             // release ownership
             self.biased_word
@@ -279,6 +289,7 @@ impl RawBrcHeader {
         }
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
+            eprintln!("Queued {self:?}");
             let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
             let owner_id = biased_word
                 .owner_id
@@ -309,7 +320,7 @@ impl RawBrcHeader {
         } else if new.merged && new.shared_count.value() == 0 {
             // SAFETY: Valid to deallocate
             unsafe {
-                drop.dealloc_header(NonNull::from(self));
+                drop.dealloc(NonNull::from(self));
             }
         }
     }
@@ -322,6 +333,26 @@ unsafe impl Sync for RawBrcHeader {}
 struct FastIncrementFailure;
 #[derive(Debug)]
 struct FastDecrementFailure;
+impl Debug for RawBrcHeader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let RawBrcHeader {
+            marker: _,
+            biased_word,
+            shared_word,
+        } = self;
+        // Relaxed ordering is what Debug impl the atomics use
+        f.debug_struct("RawBrcHeader")
+            .field(
+                "biased_word",
+                &BiasedWord::from_raw(biased_word.load(Ordering::Relaxed)),
+            )
+            .field(
+                "shared_word",
+                &SharedWord::from_raw(shared_word.load(Ordering::Relaxed)),
+            )
+            .finish()
+    }
+}
 
 /// The information needed by the runtime to drop a type.
 //
@@ -336,72 +367,48 @@ struct FastDecrementFailure;
 /// # Safety
 /// This trait is safe to implement, but all uses are unsafe.
 pub trait DropInfo: Copy {
-    /// Return `true` if the destructor needs to run or `false` otherwise.
-    ///
-    /// Intended to complete quickly rather than giving accurate answers.
-    /// It is intended to be monomorphized away.
-    fn needs_drop(&self) -> bool;
     /// The offset to add to the header to get to the value.
     fn value_offset(&self) -> isize;
     /// The context needed to invoke [`Self::erased_dealloc`].
     fn erased_context(&self) -> ErasedDestructorContext;
-    unsafe fn erased_dealloc(value_ptr: NonNull<c_void>, ctx: ErasedDestructorContext);
+    unsafe fn erased_dealloc(
+        header_ptr: NonNull<RawBrcHeader>,
+        ctx: ErasedDestructorContext,
+        value_offset: isize,
+    );
+    /// Deallocate the specified header using this drop information.
+    ///
     /// # Safety
-    /// Same requirements as [`Self::erased_dealloc`],
-    /// but additionally requires the [`Self::value_offset`] to be correct for the header.
+    /// Same requirements as [`Self::erased_dealloc`].
     #[inline]
-    unsafe fn dealloc_header(&self, header_ptr: NonNull<RawBrcHeader>) {
-        if self.needs_drop() {
-            // SAFETY: Caller guarantees the type and offset are correct
-            let value_ptr = unsafe { header_ptr.cast::<c_void>().byte_offset(self.value_offset()) };
-            // SAFETY: Caller guarantees the validity of the pointer
-            unsafe { Self::erased_dealloc(value_ptr, self.erased_context()) }
-        }
+    unsafe fn dealloc(&self, header_ptr: NonNull<RawBrcHeader>) {
+        // SAFETY: Requirements guaranteed by caller
+        unsafe { Self::erased_dealloc(header_ptr, self.erased_context(), self.value_offset()) }
     }
     #[inline]
     fn erase(&self) -> ErasedDropInfo {
-        if !self.needs_drop() {
-            ErasedDropInfo::Nop
-        } else {
-            ErasedDropInfo::NeedsDrop {
-                value_offset: self.value_offset(),
-                erased_ctx: self.erased_context(),
-                erased_func: Self::erased_dealloc,
-            }
+        ErasedDropInfo {
+            value_offset: self.value_offset(),
+            erased_ctx: self.erased_context(),
+            erased_func: Self::erased_dealloc,
         }
     }
 }
 /// An erased version of [`DropInfo`].
 ///
-/// This is similar to a `Box<dyn DropTypeInfo>` but is unboxed
-/// and is limited to a subset of the triat's functionality.
+/// This is similar to a `dyn DropTypeInfo` but is owned, sized,
+/// and limited to a subset of the triat's functionality.
 #[derive(Clone)]
-pub enum ErasedDropInfo {
-    /// Indicates that the type doesn't need to be dropped,
-    /// so no information is retained.
-    Nop,
-    NeedsDrop {
-        value_offset: isize,
-        erased_ctx: ErasedDestructorContext,
-        erased_func: unsafe fn(NonNull<c_void>, ErasedDestructorContext),
-    },
+pub struct ErasedDropInfo {
+    value_offset: isize,
+    erased_ctx: ErasedDestructorContext,
+    erased_func: unsafe fn(NonNull<RawBrcHeader>, ErasedDestructorContext, isize),
 }
 impl ErasedDropInfo {
     #[inline]
-    pub unsafe fn dealloc_header(&self, header_ptr: NonNull<RawBrcHeader>) {
-        match *self {
-            ErasedDropInfo::NeedsDrop {
-                value_offset,
-                erased_ctx,
-                erased_func,
-            } => {
-                // SAFETY: Caller guarantees the type and offset are correct
-                let value_ptr = unsafe { header_ptr.cast::<c_void>().byte_offset(value_offset) };
-                // SAFETY: Caller guarantees the validity of the pointer
-                unsafe { (erased_func)(value_ptr, erased_ctx) }
-            }
-            ErasedDropInfo::Nop => {}
-        }
+    pub unsafe fn dealloc(&self, header_ptr: NonNull<RawBrcHeader>) {
+        // SAFETY: Caller guarantees the validity of the pointer
+        unsafe { (self.erased_func)(header_ptr, self.erased_ctx, self.value_offset) }
     }
 }
 /// The context for a [`DropInfo`], erased so that the real type is unknown.
@@ -423,8 +430,8 @@ impl BiasedWord {
     };
     #[inline]
     fn to_raw(self) -> u32 {
-        (self.biased_count.value() as u32)
-            | (self.owner_id.map_or(0, |value| value.value().value()) << ShortThreadId::BITS)
+        ((self.biased_count.value() as u32) << ShortThreadId::BITS)
+            | (self.owner_id.map_or(0, |value| value.value().value()))
     }
     #[inline]
     fn from_raw(raw: u32) -> Self {
@@ -474,31 +481,37 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     let biased = BiasedWord::from_raw(header.biased_word.load(Ordering::Relaxed));
     // now update the shared word
     assert_eq!(biased.owner_id, Some(biased_tid));
-    let new_word = header
-        .shared_word
-        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old_word| {
-            let old_word = SharedWord::from_raw(old_word);
-            assert!(!old_word.merged);
-            #[expect(clippy::cast_possible_wrap, reason = "an u14 fits in an i16")]
-            let biased_count = i30::from(biased.biased_count.value() as i16);
-            Some(
-                SharedWord {
-                    shared_count: old_word
-                        .shared_count
-                        .checked_add(biased_count)
-                        .expect("refcnt overflow when merging pointers"),
-                    merged: true,
-                    ..old_word
-                }
-                .to_raw(),
-            )
-        })
-        .map(SharedWord::from_raw)
-        .unwrap();
+    let mut old_word = SharedWord::from_raw(header.shared_word.load(Ordering::Relaxed));
+    let mut new_word: SharedWord;
+    loop {
+        assert!(!old_word.merged);
+        #[expect(clippy::cast_possible_wrap, reason = "an u14 fits in an i16")]
+        let biased_count = i30::from(biased.biased_count.value() as i16);
+        new_word = SharedWord {
+            shared_count: old_word
+                .shared_count
+                .checked_add(biased_count)
+                .expect("refcnt overflow when merging pointers"),
+            merged: true,
+            ..old_word
+        };
+        match header.shared_word.compare_exchange_weak(
+            old_word.to_raw(),
+            new_word.to_raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual_value) => {
+                old_word = SharedWord::from_raw(actual_value);
+                continue;
+            }
+        }
+    }
     assert!(new_word.shared_count.value() >= 0, "{new_word:?}");
     if new_word.shared_count.value() == 0 {
         // SAFETY: Caller promises the drop function is valid
-        unsafe { object.drop.dealloc_header(object.header_ptr) }
+        unsafe { object.drop.dealloc(object.header_ptr) }
     } else {
         // release ownership/unbias
         header.biased_word.store(
@@ -507,7 +520,30 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
                 biased_count: u14::ZERO,
             }
             .to_raw(),
-            Ordering::Release,
+            Ordering::Relaxed,
         );
     }
+}
+
+/// Perform thread-local cleanup operations if deemed necessary.
+///
+/// This is necessary to unbias reference counts migrating across threads.
+///
+/// This function is implicitly called by [`crate::Brc::new`],
+/// [`crate::Brc::clone`], and [`crate::Brc::drop`],
+/// so only it needs to be invoked implicitly if a thread goes a long time without calling these functions.
+///
+/// # Panics
+/// Will never panic, but may abort if internal state is irreparably corrupted.
+#[inline]
+pub fn collect() {
+    // This always costs a TLS lookup, which can be relatively expensive
+    // If queuing is rare enough it might make sense to add a global flag
+    let _ = LocalThreadState::with_current(LocalThreadState::collect);
+}
+
+/// Forcibly perform the [`cleanup`] operation, regardless of internal heuristics.
+#[cold]
+pub fn collect_force() {
+    let _ = LocalThreadState::with_current(LocalThreadState::collect_force);
 }

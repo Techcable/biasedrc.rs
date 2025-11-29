@@ -54,7 +54,6 @@ fn-to-numeric-cast-with-truncation = "deny"
 cast-lossless = "allow" # lossless casts are fine, lints will catch if types change
 ptr_as_ptr = "allow" # pointer casts are fine as long as they don't violate another rule
 
-
 # excessively pedantic (even for clippy::pedantic)
 too-many-lines = "allow"
 must-use-candidate = "allow"
@@ -63,3 +62,5 @@ explicit-deref-methods = "allow"
 single-match-else = "allow"
 if-not-else = "allow"
 needless-pass-by-value = "allow"
+inline-always = "allow"
+needless-continue = "allow"

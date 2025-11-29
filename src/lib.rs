@@ -1,7 +1,6 @@
 //! An implementation of [biased reference counting] for Rust.
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
-
 use crate::pointee::SupportedPointeeInternal;
 use pointee::SupportedMetadata;
 use ptr_meta::Pointee;
@@ -10,7 +9,6 @@ use std::alloc::Layout;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::error::Error;
-use std::ffi::c_void;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -21,6 +19,8 @@ use std::ptr::NonNull;
 mod runtime;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
+
+pub use crate::runtime::{collect, collect_force};
 
 struct LayoutInfo {
     value_offset: isize,
@@ -126,6 +126,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// Callback must either fully initialize the memory or panic.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
     unsafe fn alloc_with(layout: Layout, meta: T::Metadata, func: impl FnOnce(*mut T)) -> Brc<T> {
+        collect();
         #[cold]
         #[inline(never)]
         fn layout_overflow() -> ! {
@@ -235,6 +236,9 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
 impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
     #[inline]
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            collect();
+        }
         let value: &T = self.deref();
         let context = DropContext::<T> {
             metadata: ptr_meta::metadata(value),
@@ -248,6 +252,7 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
     #[inline]
     fn clone(&self) -> Self {
+        collect();
         self.header().increment_strong();
         // SAFETY: Just successfully incremented the refcnt
         unsafe { Brc::from_raw(self.ptr) }
@@ -268,11 +273,6 @@ impl<T: ?Sized + SupportedPointee> Clone for DropContext<T> {
 }
 impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
     #[inline]
-    fn needs_drop(&self) -> bool {
-        std::mem::needs_drop::<T>()
-    }
-
-    #[inline]
     fn value_offset(&self) -> isize {
         self.value_offset
     }
@@ -283,14 +283,29 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
     }
 
     #[inline]
-    unsafe fn erased_dealloc(value_ptr: NonNull<c_void>, ctx: ErasedDestructorContext) {
+    unsafe fn erased_dealloc(
+        header_ptr: NonNull<RawBrcHeader>,
+        ctx: ErasedDestructorContext,
+        value_offset: isize,
+    ) {
         let value: *mut T = ptr_meta::from_raw_parts_mut(
-            value_ptr.as_ptr().cast(),
+            // SAFETY: Caller guarantees that the value_offset is valid
+            unsafe { header_ptr.as_ptr().byte_offset(value_offset).cast() },
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
-        // SAFETY: Caller guarantees this is not invoked until it is valid to drop
-        unsafe { core::ptr::drop_in_place(value) }
+        // SAFETY: Valid since T has not been dropped yet.
+        // However, this violates stacked borrow. It works fine for tree borrows)
+        let layout = unsafe { Layout::for_value(&*value) };
+        if std::mem::needs_drop::<T>() {
+            // SAFETY: Caller guarantees this is not invoked until it is valid to drop
+            unsafe { core::ptr::drop_in_place(value) }
+        }
+        // SAFETY: Know the layout will not overflow since already allocated
+        let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
+        debug_assert_eq!(layout_info.value_offset, value_offset);
+        // SAFETY: Caller guarantees it is valid to drop the header too
+        unsafe { std::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
     }
 }
 

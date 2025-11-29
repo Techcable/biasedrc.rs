@@ -1,7 +1,14 @@
+export RUST_BACKTRACE := "1"
+
 test: _check && check-format
     cargo nextest run
 
-check: _check && check-format
+# Due to use of header arithmeitc, we cannot pass stacked borrows yet,
+# only tree borrows
+export MIRIFLAGS := "-Zmiri-tree-borrows -Zmiri-env-forward=RUST_BACKTRACE"
+
+miri *args: _check && check-format
+    cargo +nightly miri nextest run {{args}}
 
 _check:
     cargo clippy --all-targets
