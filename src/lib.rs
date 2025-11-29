@@ -8,9 +8,9 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
-mod raw;
+mod runtime;
 
-use crate::raw::{DestructorFunc, RawBrcHeader};
+use crate::runtime::{DestructorFunc, RawBrcHeader};
 
 fn header_offset<T>() -> Result<usize, std::alloc::LayoutError> {
     Ok(Layout::new::<RawBrcHeader>().extend(Layout::new::<T>())?.1)

@@ -1,4 +1,4 @@
-use crate::raw::threads::{InvalidThreadError, ShortThreadId};
+use crate::runtime::threads::{InvalidThreadError, ShortThreadId};
 use arbitrary_int::prelude::*;
 use core::marker::PhantomPinned;
 use core::sync::atomic::AtomicU32;

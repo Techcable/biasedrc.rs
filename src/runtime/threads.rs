@@ -1,4 +1,4 @@
-use crate::raw::{BiasedWord, QueuedObject};
+use crate::runtime::{BiasedWord, QueuedObject};
 use arbitrary_int::prelude::*;
 use atomic::Atomic;
 use core::ptr::NonNull;
