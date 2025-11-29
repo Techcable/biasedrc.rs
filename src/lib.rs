@@ -58,6 +58,67 @@ impl<T> Brc<T> {
         unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(value)) }
     }
 }
+impl<T> Brc<[T]> {
+    /// Allocate a slice of memory rom a [`Layout`] and a,
+    /// whose length is trusted to be exact.
+    ///
+    /// The iterator is permitted to panic, both in [`Iterator::next`] and [`Drop`].
+    ///
+    /// # Safety
+    /// The layout must match the result of [`Layout::array`].
+    /// The calculation is moved to the caller to potentially avoid a panic.
+    ///
+    /// The iterator must either panic or yield precisely as many elements as its length.
+    #[deny(clippy::multiple_unsafe_ops_per_block)]
+    pub unsafe fn from_iter_exact_trusted(
+        layout: Layout,
+        mut iter: impl ExactSizeIterator<Item = T>,
+    ) -> Self {
+        let len = iter.len();
+        debug_assert_eq!(Ok(layout), Layout::array::<T>(len));
+        let do_init = |dest| {
+            let dest = dest as *mut T;
+            struct PartialDropGuard<T> {
+                dest: *mut T,
+                initialized_len: usize,
+            }
+            impl<T> Drop for PartialDropGuard<T> {
+                fn drop(&mut self) {
+                    if core::mem::needs_drop::<T>() {
+                        let initialized =
+                            std::ptr::slice_from_raw_parts_mut(self.dest, self.initialized_len);
+                        // SAFETY: Trust that `len` items have been initialized
+                        unsafe {
+                            core::ptr::drop_in_place(initialized);
+                        }
+                    }
+                }
+            }
+            let mut guard = PartialDropGuard {
+                dest,
+                initialized_len: 0,
+            };
+            for index in 0..len {
+                guard.initialized_len = index;
+                // SAFETY: We trust the length to be exact
+                let item = unsafe { iter.next().unwrap_unchecked() };
+                // SAFETY: Index is in bounds
+                let slot = unsafe { dest.add(index) };
+                // SAFETY: Newly allocated memory is known to be valid
+                unsafe { slot.write(item) };
+            }
+            // call next() function one more time, to trigger panic in AssertExactIter
+            // We don't want to do this in the drop function as that could trigger a double-panic
+            // This is zero-cost if the iterator has no side effects
+            let _ = iter.next();
+            drop(iter); // this is permitted to panic
+            std::mem::forget(guard); // finished initialization
+        };
+        // SAFETY: Either fully initializes the memory or panics
+        // We trust the iterator to be exact.
+        unsafe { Brc::alloc_with(layout, len, do_init) }
+    }
+}
 impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// Initialize the value using the specified callback.
     ///
@@ -253,8 +314,8 @@ mod pointee {
     ///
     /// This performs double-duty by ensuring the trait is sealed.
     pub trait SupportedPointeeInternal: Pointee<Metadata: SupportedMetadata> {}
-    impl<T: Pointee> SupportedPointeeInternal for T where T::Metadata: SupportedMetadata {}
-    impl<T: Pointee> super::SupportedPointee for T where T::Metadata: SupportedMetadata {}
+    impl<T: ?Sized + Pointee> SupportedPointeeInternal for T where T::Metadata: SupportedMetadata {}
+    impl<T: ?Sized + Pointee> super::SupportedPointee for T where T::Metadata: SupportedMetadata {}
 
     /// Indicates that the metadata is supported, meaning it is at most pointer sized.
     ///
@@ -330,6 +391,75 @@ impl<T> From<T> for Brc<T> {
     #[inline]
     fn from(value: T) -> Self {
         Brc::new(value)
+    }
+}
+impl<T: Clone> From<&[T]> for Brc<[T]> {
+    fn from(src: &[T]) -> Self {
+        let layout = Layout::for_value(src);
+        // SAFETY: We trust the slice iterator + cloned() to have correct length
+        unsafe { Self::from_iter_exact_trusted(layout, src.iter().cloned()) }
+    }
+}
+impl<T> From<Vec<T>> for Brc<[T]> {
+    fn from(value: Vec<T>) -> Self {
+        let layout = Layout::for_value(value.as_slice());
+        // SAFETY: We trust the Vec iterator to have the correct length
+        unsafe { Self::from_iter_exact_trusted(layout, value.into_iter()) }
+    }
+}
+impl From<&str> for Brc<str> {
+    #[inline]
+    fn from(value: &str) -> Self {
+        let bytes = Brc::<[u8]>::from(value.as_bytes());
+        // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
+        unsafe {
+            Brc::from_raw(NonNull::new_unchecked(
+                Brc::into_raw(bytes).as_ptr() as *mut str
+            ))
+        }
+    }
+}
+impl<T> FromIterator<T> for Brc<[T]> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        if Some(lower) == upper {
+            /// Verifies that the iterator has the claimed length,
+            /// and panics if it doesn't.
+            struct AssertExactIter<I: Iterator<Item = T>, T> {
+                inner: I,
+                len: usize,
+            }
+            impl<I: Iterator<Item = T>, T> Iterator for AssertExactIter<I, T> {
+                type Item = T;
+                #[inline]
+                #[track_caller]
+                fn next(&mut self) -> Option<Self::Item> {
+                    match (self.inner.next(), self.len) {
+                        (None, 0) => None,
+                        (Some(_), 0) => panic!("Iterator yielded more items than claimed length"),
+                        (Some(item), _) => {
+                            self.len -= 1;
+                            Some(item)
+                        }
+                        (None, _) => panic!("Iterator yielded fewer items than claimed length"),
+                    }
+                }
+                #[inline]
+                fn size_hint(&self) -> (usize, Option<usize>) {
+                    (self.len, Some(self.len))
+                }
+            }
+            impl<I: Iterator<Item = T>, T> ExactSizeIterator for AssertExactIter<I, T> {}
+            let len = lower;
+            let layout = Layout::array::<T>(len).expect("Layout overflow");
+            // SAFETY: The AssertExactIter verifies the length is correct
+            // The Layout is correct
+            unsafe { Self::from_iter_exact_trusted(layout, AssertExactIter { len, inner: iter }) }
+        } else {
+            // need to buffer
+            iter.collect::<Vec<T>>().into()
+        }
     }
 }
 impl<T: ?Sized + SupportedPointee> Borrow<T> for Brc<T> {
