@@ -155,11 +155,11 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
             ptr: allocated,
             layout: layout.full_layout,
         };
-        // SAFETY: Memory is newly allocated so it is known to be valid
         #[expect(
             clippy::cast_ptr_alignment,
             reason = "allocated with appropriate alignment"
         )]
+        // SAFETY: Memory is newly allocated so it is known to be valid
         unsafe {
             allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
         }
