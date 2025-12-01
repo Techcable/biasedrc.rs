@@ -270,9 +270,9 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
         };
         // SAFETY: Header must be valid
         // We cannot deref from &self pointer as it causes aliasing issues in tree borrows
-        let header_ptr = unsafe { &(*self.inner.as_ptr()).header };
+        let header_ptr = unsafe { &raw const (*self.inner.as_ptr()).header };
         // SAFETY: We own a reference count and the context is valid
-        unsafe { (*header_ptr).decrement_strong(context) }
+        unsafe { RawBrcHeader::decrement_strong(header_ptr, context) }
     }
 }
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
@@ -314,13 +314,13 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
 
     #[inline]
     unsafe fn erased_dealloc(
-        header_ptr: NonNull<RawBrcHeader>,
+        header_ptr: *mut RawBrcHeader,
         ctx: ErasedDestructorContext,
         value_offset: isize,
     ) {
         let value: *mut T = ptr_meta::from_raw_parts_mut(
             // SAFETY: Caller guarantees that the value_offset is valid
-            unsafe { header_ptr.as_ptr().byte_offset(value_offset).cast::<()>() },
+            unsafe { header_ptr.byte_offset(value_offset) },
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
@@ -335,7 +335,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
         let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
         debug_assert_eq!(layout_info.value_offset, value_offset);
         // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { std::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
+        unsafe { std::alloc::dealloc(header_ptr.cast(), layout_info.full_layout) };
     }
 }
 

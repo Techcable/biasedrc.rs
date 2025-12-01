@@ -5,9 +5,7 @@ test: _check && check-format
     # disabled stable run
     # cargo +stable nextest run
 
-# Due to use of header arithmeitc, we cannot pass stacked borrows yet,
-# only tree borrows
-export MIRIFLAGS := "-Zmiri-tree-borrows -Zmiri-env-forward=RUST_BACKTRACE"
+export MIRIFLAGS := "-Zmiri-env-forward=RUST_BACKTRACE"
 
 miri *args: _check && check-format
     cargo +nightly miri nextest run {{args}}
