@@ -1,7 +1,8 @@
 export RUST_BACKTRACE := "1"
 
 test: _check && check-format
-    cargo nextest run
+    cargo nextest run --all-features
+    cargo +stable nextest run
 
 # Due to use of header arithmeitc, we cannot pass stacked borrows yet,
 # only tree borrows
@@ -13,7 +14,7 @@ miri *args: _check && check-format
 check: _check check-format
 
 _check:
-    cargo clippy --all-targets
+    cargo clippy --all-targets --all-features
     cargo +stable clippy --all-targets
 
 format: && spellcheck

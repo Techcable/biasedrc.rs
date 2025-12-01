@@ -1,8 +1,14 @@
 //! An implementation of [biased reference counting] for Rust.
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
-use crate::pointee::SupportedPointeeInternal;
-use pointee::SupportedMetadata;
+#![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
+
+#[cfg(feature = "nightly-ptr-meta")]
+use core::ptr as ptr_meta;
+#[cfg(not(feature = "nightly-ptr-meta"))]
+use ptr_meta_stable as ptr_meta;
+
+use pointee::{SupportedMetadata, SupportedPointeeInternal};
 use ptr_meta::Pointee;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 use std::alloc::Layout;
@@ -290,7 +296,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
     ) {
         let value: *mut T = ptr_meta::from_raw_parts_mut(
             // SAFETY: Caller guarantees that the value_offset is valid
-            unsafe { header_ptr.as_ptr().byte_offset(value_offset).cast() },
+            unsafe { header_ptr.as_ptr().byte_offset(value_offset).cast::<()>() },
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
@@ -323,7 +329,11 @@ pub trait SupportedPointee: SupportedPointeeInternal {}
 /// The internals of [`SupportedPointee`], using the [`ptr_meta`] crate.
 mod pointee {
     use crate::runtime::ErasedDestructorContext;
+    #[cfg(feature = "nightly-ptr-meta")]
+    use core::ptr as ptr_meta;
     use ptr_meta::{DynMetadata, Pointee};
+    #[cfg(not(feature = "nightly-ptr-meta"))]
+    use ptr_meta_stable as ptr_meta;
 
     /// The sealed internals of [`SupportedPointee`], hidden from the public.
     ///

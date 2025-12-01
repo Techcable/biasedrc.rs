@@ -16,12 +16,17 @@ parking_lot = "0.12"
 thiserror = "2"
 crossbeam-queue = "0.3"
 arbitrary-int = "2"
-ptr_meta = "0.3"
 nounwind = { version = "0.1", features = ["std"], default-features = false }
 stable_deref_trait = "1.2"
+# Emulate the ptr_metadata unstable feature on stable rust
+ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 
 [features]
-nightly = []
+# Use the nightly pointer metadata feature instead of the stable one
+#
+# Removing this feature could break some code,
+# as it means you will need to use the ptr_meta crate instead.
+nightly-ptr-meta = []
 
 [lints.rust]
 missing-docs = "warn"
