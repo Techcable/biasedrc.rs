@@ -176,7 +176,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         func(value_ptr);
         std::mem::forget(guard);
         // SAFETY: Allocated pointer is valid and never null
-        unsafe { Self::from_raw(NonNull::new_unchecked(value_ptr)) }
+        unsafe { Self::from_raw(value_ptr) }
     }
     /// Create a [`Brc`] from a raw pointer,
     /// similar to [`std::sync::Arc::from_raw`].
@@ -190,9 +190,10 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// # Panics
     /// This function is infallible.
     #[inline]
-    pub unsafe fn from_raw(ptr: NonNull<T>) -> Brc<T> {
+    pub unsafe fn from_raw(ptr: *mut T) -> Brc<T> {
         Brc {
-            ptr,
+            // SAFETY: Cannot be null as it comes from `into_raw`
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
             marker: PhantomData,
         }
     }
@@ -207,9 +208,9 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// This function is infallible.
     #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
     #[inline]
-    pub fn into_raw(this: Self) -> NonNull<T> {
+    pub fn into_raw(this: Self) -> *mut T {
         let value = ManuallyDrop::new(this);
-        value.ptr
+        value.ptr.as_ptr()
     }
 
     #[inline]
@@ -261,7 +262,7 @@ impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
         collect();
         self.header().increment_strong();
         // SAFETY: Just successfully incremented the refcnt
-        unsafe { Brc::from_raw(self.ptr) }
+        unsafe { Brc::from_raw(self.ptr.as_ptr()) }
     }
 }
 
@@ -437,11 +438,7 @@ impl From<&str> for Brc<str> {
     fn from(value: &str) -> Self {
         let bytes = Brc::<[u8]>::from(value.as_bytes());
         // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
-        unsafe {
-            Brc::from_raw(NonNull::new_unchecked(
-                Brc::into_raw(bytes).as_ptr() as *mut str
-            ))
-        }
+        unsafe { Brc::from_raw(Brc::into_raw(bytes) as *mut str) }
     }
 }
 impl<T> FromIterator<T> for Brc<[T]> {
