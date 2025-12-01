@@ -152,20 +152,25 @@ impl RawBrcHeader {
     /// The header must have been previously constructed using [`Self::init`],
     /// which allows skipping some initialization checks.
     #[inline]
-    pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) {
+    pub unsafe fn decrement_strong<D: DropInfo>(this_ptr: *const Self, drop: D) {
         // SAFETY: Caller guarantees drop function is valid and RC is owned
-        match unsafe { self.fast_decrement(drop) } {
+        match unsafe { Self::fast_decrement(this_ptr, drop) } {
             Ok(()) => {} // nothing more to do
             Err(FastDecrementFailure) => {
                 // SAFETY: Caller guarantees drop function is valid and RC is owned
-                unsafe { self.slow_decrement_trampoline(drop) }
+                unsafe { Self::slow_decrement_trampoline(this_ptr, drop) }
             }
         }
     }
 
     #[inline]
-    unsafe fn fast_decrement<D: DropInfo>(&self, drop: D) -> Result<(), FastDecrementFailure> {
-        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+    unsafe fn fast_decrement<D: DropInfo>(
+        this_ptr: *const Self,
+        drop: D,
+    ) -> Result<(), FastDecrementFailure> {
+        // SAFETY: Caller guarantees pointer is valid
+        let this = unsafe { &*this_ptr };
+        let biased_word = BiasedWord::from_raw(this.biased_word.load(Ordering::Relaxed));
         let owner_id = biased_word.owner_id.ok_or(FastDecrementFailure)?;
         let this_id = match LocalThreadState::existing_short_id() {
             Ok(short_id) => short_id,
@@ -187,7 +192,7 @@ impl RawBrcHeader {
             // can just update the reference count
             if new_biased_count.value() > 0 {
                 // store updated reference count
-                self.biased_word.store(
+                this.biased_word.store(
                     BiasedWord {
                         biased_count: new_biased_count,
                         ..biased_word
@@ -199,7 +204,7 @@ impl RawBrcHeader {
             } else {
                 // SAFETY: We have already verified that we are the biased thread
                 unsafe {
-                    self.fast_decrement_slow::<D>(drop);
+                    Self::fast_decrement_slow::<D>(this_ptr, drop);
                 }
                 Ok(())
             }
@@ -218,9 +223,11 @@ impl RawBrcHeader {
     /// and that it is still "biased".
     #[cold]
     #[inline(never)]
-    unsafe fn fast_decrement_slow<D: DropInfo>(&self, drop: D) {
+    unsafe fn fast_decrement_slow<D: DropInfo>(this_ptr: *const Self, drop: D) {
+        // SAFETY: Caller guarantees validity
+        let this = unsafe { &*this_ptr };
         let new = SharedWord::from_raw(
-            self.shared_word
+            this.shared_word
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
                     let old = SharedWord::from_raw(old);
                     debug_assert!(!old.merged);
@@ -236,12 +243,11 @@ impl RawBrcHeader {
         );
         debug_assert!(new.shared_count.value() >= 0);
         if new.shared_count.value() == 0 {
-            let header_ptr = NonNull::from(self);
             // SAFETY: The pointer is valid, and it is time to deallocate
-            unsafe { drop.dealloc(header_ptr) }
+            unsafe { drop.dealloc(this_ptr.cast_mut()) }
         } else {
             // release ownership
-            self.biased_word
+            this.biased_word
                 .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
         }
     }
@@ -253,15 +259,17 @@ impl RawBrcHeader {
     /// the layout is constant, or no destructor is needed.
     #[cold]
     #[inline(never)]
-    unsafe fn slow_decrement_trampoline<D: DropInfo>(&self, drop: D) {
+    unsafe fn slow_decrement_trampoline<D: DropInfo>(this_ptr: *const Self, drop: D) {
         // SAFETY: All invariants are responsibility of the caller
-        unsafe { self.slow_decrement(drop.erase()) }
+        unsafe { Self::slow_decrement(this_ptr, drop.erase()) }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn slow_decrement(&self, drop: ErasedDropInfo) {
-        let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
+    unsafe fn slow_decrement(this_ptr: *const Self, drop: ErasedDropInfo) {
+        // SAFETY: Validity guaranteed by caller
+        let this = unsafe { &*this_ptr };
+        let mut old = SharedWord::from_raw((*this).shared_word.load(Ordering::Relaxed));
         let mut new: SharedWord;
         loop {
             new = SharedWord {
@@ -274,7 +282,7 @@ impl RawBrcHeader {
             if new.shared_count.value() < 0 {
                 new.queued = true;
             }
-            match self.shared_word.compare_exchange_weak(
+            match this.shared_word.compare_exchange_weak(
                 old.to_raw(),
                 new.to_raw(),
                 Ordering::AcqRel,
@@ -286,7 +294,7 @@ impl RawBrcHeader {
         }
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
-            let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+            let biased_word = BiasedWord::from_raw(this.biased_word.load(Ordering::Relaxed));
             let owner_id = biased_word
                 .owner_id
                 .expect("due to negative refcnt, must have owner");
@@ -295,7 +303,8 @@ impl RawBrcHeader {
                 threads::SharedThreadInfo::get_by_id(owner_id)
                     .expect("owner thread info is undefined")
                     .queue_object(QueuedObject {
-                        header_ptr: NonNull::from(self),
+                        // need to use `this_ptr` due to stacked borrows
+                        header_ptr: NonNull::new_unchecked(this_ptr.cast_mut()),
                         drop: drop.clone(),
                     })
             } {
@@ -306,7 +315,7 @@ impl RawBrcHeader {
                         self::explicit_merge(
                             owner_id,
                             QueuedObject {
-                                header_ptr: NonNull::from(self),
+                                header_ptr: NonNull::new_unchecked(this_ptr.cast_mut()),
                                 drop,
                             },
                         );
@@ -316,7 +325,7 @@ impl RawBrcHeader {
         } else if new.merged && new.shared_count.value() == 0 {
             // SAFETY: Valid to deallocate
             unsafe {
-                drop.dealloc(NonNull::from(self));
+                drop.dealloc(this_ptr.cast_mut());
             }
         }
     }
@@ -368,7 +377,7 @@ pub trait DropInfo: Copy {
     /// The context needed to invoke [`Self::erased_dealloc`].
     fn erased_context(&self) -> ErasedDestructorContext;
     unsafe fn erased_dealloc(
-        header_ptr: NonNull<RawBrcHeader>,
+        header_ptr: *mut RawBrcHeader,
         ctx: ErasedDestructorContext,
         value_offset: isize,
     );
@@ -377,7 +386,7 @@ pub trait DropInfo: Copy {
     /// # Safety
     /// Same requirements as [`Self::erased_dealloc`].
     #[inline]
-    unsafe fn dealloc(&self, header_ptr: NonNull<RawBrcHeader>) {
+    unsafe fn dealloc(&self, header_ptr: *mut RawBrcHeader) {
         // SAFETY: Requirements guaranteed by caller
         unsafe { Self::erased_dealloc(header_ptr, self.erased_context(), self.value_offset()) }
     }
@@ -393,16 +402,16 @@ pub trait DropInfo: Copy {
 /// An erased version of [`DropInfo`].
 ///
 /// This is similar to a `dyn DropTypeInfo` but is owned, sized,
-/// and limited to a subset of the triat's functionality.
+/// and limited to a subset of the trait's functionality.
 #[derive(Clone)]
 pub struct ErasedDropInfo {
     value_offset: isize,
     erased_ctx: ErasedDestructorContext,
-    erased_func: unsafe fn(NonNull<RawBrcHeader>, ErasedDestructorContext, isize),
+    erased_func: unsafe fn(*mut RawBrcHeader, ErasedDestructorContext, isize),
 }
 impl ErasedDropInfo {
     #[inline]
-    pub unsafe fn dealloc(&self, header_ptr: NonNull<RawBrcHeader>) {
+    pub unsafe fn dealloc(&self, header_ptr: *mut RawBrcHeader) {
         // SAFETY: Caller guarantees the validity of the pointer
         unsafe { (self.erased_func)(header_ptr, self.erased_ctx, self.value_offset) }
     }
@@ -507,7 +516,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     assert!(new_word.shared_count.value() >= 0, "{new_word:?}");
     if new_word.shared_count.value() == 0 {
         // SAFETY: Caller promises the drop function is valid
-        unsafe { object.drop.dealloc(object.header_ptr) }
+        unsafe { object.drop.dealloc(object.header_ptr.as_ptr()) }
     } else {
         // release ownership/unbias
         header.biased_word.store(

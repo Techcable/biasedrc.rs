@@ -3,6 +3,9 @@
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 
+#[cfg(not(feature = "nightly-ptr-meta"))]
+compile_error!("This branch requires the `nightly-ptr-meta` feature");
+
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
 #[cfg(not(feature = "nightly-ptr-meta"))]
@@ -50,16 +53,30 @@ impl LayoutInfo {
     }
 }
 
+#[repr(C)]
+struct BrcInner<T: ?Sized + SupportedPointee> {
+    header: RawBrcHeader,
+    value: T,
+}
+
 /// A thread-safe reference counted object,
 /// biased towards a particular thread.
 pub struct Brc<T: ?Sized + SupportedPointee> {
-    ptr: NonNull<T>,
+    inner: NonNull<BrcInner<T>>,
     marker: PhantomData<T>,
 }
 impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
+        if cfg!(debug_assertions) {
+            let info = LayoutInfo::new(Layout::new::<T>()).unwrap();
+            assert_eq!(
+                info.value_offset.try_into().ok(),
+                Some(core::mem::offset_of!(BrcInner<T>, value)),
+            );
+            assert_eq!(info.full_layout, Layout::new::<BrcInner<T>>(),);
+        }
         // SAFETY: We fully initialize the newly allocated memory
         unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(value)) }
     }
@@ -176,7 +193,12 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         func(value_ptr);
         std::mem::forget(guard);
         // SAFETY: Allocated pointer is valid and never null
-        unsafe { Self::from_raw(NonNull::new_unchecked(value_ptr)) }
+        unsafe {
+            Brc {
+                inner: NonNull::from_raw_parts(NonNull::new_unchecked(allocated), meta),
+                marker: PhantomData,
+            }
+        }
     }
     /// Create a [`Brc`] from a raw pointer,
     /// similar to [`std::sync::Arc::from_raw`].
@@ -191,8 +213,13 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// This function is infallible.
     #[inline]
     pub unsafe fn from_raw(ptr: NonNull<T>) -> Brc<T> {
+        let layout = Layout::for_value(&ptr);
+        // SAFETY: Pointer came from `into_raw`, so must be valid allocation
+        let layout = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
+        // SAFETY: Known to be in-bounds since it came from `int_raw`
+        let header_addr = unsafe { ptr.byte_offset(layout.header_offset()).cast::<()>() };
         Brc {
-            ptr,
+            inner: NonNull::from_raw_parts(header_addr, ptr_meta::metadata(ptr.as_ptr())),
             marker: PhantomData,
         }
     }
@@ -208,8 +235,9 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
     #[inline]
     pub fn into_raw(this: Self) -> NonNull<T> {
-        let value = ManuallyDrop::new(this);
-        value.ptr
+        let this = ManuallyDrop::new(this);
+        // SAFETY: Our inner pointer is valid, and is not actually null
+        unsafe { NonNull::new_unchecked(&raw mut (*this.inner.as_ptr()).value) }
     }
 
     #[inline]
@@ -218,25 +246,14 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         // SAFETY: Cannot overflow since the value has already been allocated
         unsafe { LayoutInfo::new(this_layout).unwrap_unchecked() }
     }
-    #[inline]
-    fn header(&self) -> &RawBrcHeader {
-        let header_offset = self.layout().header_offset();
-        // SAFETY: A Brc always has a valid header, which can then be dereferenced
-        unsafe {
-            self.ptr
-                .cast::<u8>()
-                .offset(header_offset)
-                .cast::<RawBrcHeader>()
-                .as_ref()
-        }
-    }
 }
 impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
-        // SAFETY: Object lives at least as long as we do
-        unsafe { self.ptr.as_ref() }
+        // SAFETY: Object lives at least as long as we do,
+        // and we know our own pointer is valid
+        unsafe { &self.inner.as_ref().value }
     }
 }
 impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
@@ -251,17 +268,24 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
             value_offset: self.layout().value_offset,
             marker: PhantomData,
         };
+        // SAFETY: Header must be valid
+        // We cannot deref from &self pointer as it causes aliasing issues in tree borrows
+        let header_ptr = unsafe { &raw const (*self.inner.as_ptr()).header };
         // SAFETY: We own a reference count and the context is valid
-        unsafe { self.header().decrement_strong(context) }
+        unsafe { RawBrcHeader::decrement_strong(header_ptr, context) }
     }
 }
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
     #[inline]
     fn clone(&self) -> Self {
         collect();
-        self.header().increment_strong();
+        // SAFETY: We know our own pointer is valid
+        unsafe { &self.inner.as_ref().header }.increment_strong();
         // SAFETY: Just successfully incremented the refcnt
-        unsafe { Brc::from_raw(self.ptr) }
+        Brc {
+            inner: self.inner,
+            marker: PhantomData,
+        }
     }
 }
 
@@ -290,13 +314,13 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
 
     #[inline]
     unsafe fn erased_dealloc(
-        header_ptr: NonNull<RawBrcHeader>,
+        header_ptr: *mut RawBrcHeader,
         ctx: ErasedDestructorContext,
         value_offset: isize,
     ) {
         let value: *mut T = ptr_meta::from_raw_parts_mut(
             // SAFETY: Caller guarantees that the value_offset is valid
-            unsafe { header_ptr.as_ptr().byte_offset(value_offset).cast::<()>() },
+            unsafe { header_ptr.byte_offset(value_offset) },
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
@@ -311,7 +335,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
         let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
         debug_assert_eq!(layout_info.value_offset, value_offset);
         // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { std::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
+        unsafe { std::alloc::dealloc(header_ptr.cast(), layout_info.full_layout) };
     }
 }
 
