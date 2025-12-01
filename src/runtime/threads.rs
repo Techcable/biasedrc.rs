@@ -423,7 +423,6 @@ fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
         let queued_objects = Box::new(SegQueue::new());
         let cached_queue = NonNull::from(queued_objects.deref());
         let index = THREADS.push_with(|id| {
-            println!("Initializing thread {id}");
             let id = UniqueThreadId::from_index(id);
             match ShortThreadId::try_from(id) {
                 Ok(short_id) => Ok(Box::leak(Box::new(SharedThreadInfo {

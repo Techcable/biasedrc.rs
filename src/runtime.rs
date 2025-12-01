@@ -84,13 +84,11 @@ impl RawBrcHeader {
     /// This is a safe operation for the same reason that [`std::mem::forget`] is.
     #[inline]
     pub fn increment_strong(&self) {
-        eprintln!("increment_strong(start): {self:#?}");
         nounwind::abort_unwind(|| {
             if self.attempt_fast_increment().is_err() {
                 self.slow_increment();
             }
         });
-        eprintln!("increment_strong(end): {self:#?}");
     }
 
     #[inline]
@@ -155,7 +153,6 @@ impl RawBrcHeader {
     /// which allows skipping some initialization checks.
     #[inline]
     pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) {
-        eprintln!("decrement_strong(start): {self:#?}");
         // SAFETY: Caller guarantees drop function is valid and RC is owned
         match unsafe { self.fast_decrement(drop) } {
             Ok(()) => {} // nothing more to do
@@ -289,7 +286,6 @@ impl RawBrcHeader {
         }
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
-            eprintln!("Queued {self:?}");
             let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
             let owner_id = biased_word
                 .owner_id
