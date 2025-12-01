@@ -2,6 +2,9 @@
 
 use biasedrc::Brc;
 use std::cell::Cell;
+use std::error::Error;
+use std::fmt::Debug;
+use unsize::{CoerceUnsize, CoerciblePtr};
 
 /// Tests that allocation works, without testing [`Clone`].
 #[test]
@@ -37,6 +40,53 @@ fn alloc_with_clone() {
     // reverse drop
     drop(one);
     drop(two);
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("{msg}")]
+struct SimpleError {
+    msg: String,
+}
+
+/// Tests that coercions work using the `unsize` crate.
+#[test]
+fn coerce_unsize_crate() {
+    /// Does an arbitrary coercion for `dyn Error`
+    fn arbitrary_error<T: CoerciblePtr<dyn Error, Output = U>, U>(ptr: T) -> U
+    where
+        T::Pointee: Error + 'static,
+    {
+        ptr.unsize(unsize::Coercion!(to dyn Error))
+    }
+
+    const TEST_MSG: &str = "foo";
+    fn check_error<U: AsRef<dyn Error>>(val: U) {
+        assert_eq!(format!("{}", val.as_ref()), format!("{}", TEST_MSG));
+    }
+
+    let err = SimpleError {
+        msg: TEST_MSG.into(),
+    };
+    check_error(arbitrary_error::<Brc<SimpleError>, Brc<dyn Error>>(
+        Brc::new(err),
+    ));
+}
+
+#[cfg(feature = "nightly-coerce")]
+#[test]
+fn nightly_coerce() {
+    fn coerce<T: Error + 'static>(x: Brc<T>) -> Brc<dyn Error> {
+        x
+    }
+    const TEST_MSG: &str = "foo";
+    fn check_error<U: AsRef<dyn Error>>(val: U) {
+        assert_eq!(format!("{}", val.as_ref()), format!("{}", TEST_MSG));
+    }
+
+    let err = SimpleError {
+        msg: TEST_MSG.into(),
+    };
+    check_error(coerce(Brc::new(err)));
 }
 
 struct DropCounter<'a>(&'a Cell<u32>);

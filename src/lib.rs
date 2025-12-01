@@ -2,9 +2,12 @@
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
+#![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
 
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
+#[cfg(feature = "nightly-coerce")]
+use core::{marker::Unsize, ops::CoerceUnsized};
 #[cfg(not(feature = "nightly-ptr-meta"))]
 use ptr_meta_stable as ptr_meta;
 
@@ -536,3 +539,39 @@ impl<T: ?Sized + SupportedPointee> Unpin for Brc<T> {}
 unsafe impl<T: ?Sized + SupportedPointee + Sync> Sync for Brc<T> {}
 // SAFETY: We are thread safe if T is
 unsafe impl<T: ?Sized + SupportedPointee + Sync> Send for Brc<T> {}
+
+#[cfg(feature = "nightly-coerce")]
+impl<T: ?Sized, U: ?Sized> CoerceUnsized<Brc<U>> for Brc<T>
+where
+    T: Unsize<U> + SupportedPointee,
+    U: SupportedPointee,
+{
+}
+
+// SAFETY: Preserves target and provenance in replace_ptr
+unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> {
+    type Pointee = T;
+    type Output = Brc<U>;
+
+    #[inline]
+    fn as_sized_ptr(&mut self) -> *mut Self::Pointee {
+        // Use deref to acquire pointer to self
+        // NOTE: Turning this into an &mut T is UB if there is shared ownership
+        core::ptr::from_ref(&**self).cast_mut()
+    }
+
+    #[inline]
+    unsafe fn replace_ptr(self, new: *mut U) -> Self::Output {
+        // SAFETY: Caller has guaranteed that `new` is
+        // just an unsized version of the original
+        //
+        // Ownership is correctly transferred from `self` to result.
+
+        // Provenance transferred into `raw` as per each individual `into_raw`.
+        let raw = Self::into_raw(self);
+        // SAFETY: Provenance merged into `new` as per `replace_ptr`.
+        let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
+        // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
+        unsafe { Brc::from_raw(new) }
+    }
+}

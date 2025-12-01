@@ -20,6 +20,7 @@ nounwind = { version = "0.1", features = ["std"], default-features = false }
 stable_deref_trait = "1.2"
 # Emulate the ptr_metadata unstable feature on stable rust
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
+unsize = "1.1"
 
 [features]
 # Use the nightly pointer metadata feature instead of the stable one
@@ -27,6 +28,11 @@ ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = fa
 # Removing this feature could break some code,
 # as it means you will need to use the ptr_meta crate instead.
 nightly-ptr-meta = []
+# Use the nightly pointer coercison feature, to avoid needing the `unsize` crate
+#
+# Removing this feature could break some code,
+# but adding it never will.
+nightly-coerce = []
 
 [lints.rust]
 missing-docs = "warn"
