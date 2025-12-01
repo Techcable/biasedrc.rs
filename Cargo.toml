@@ -22,6 +22,8 @@ stable_deref_trait = "1.2"
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 
 [features]
+# This branch requires the nightly-ptr-meta feature,
+default = ["nightly-ptr-meta"]
 # Use the nightly pointer metadata feature instead of the stable one
 #
 # Removing this feature could break some code,
@@ -69,3 +71,4 @@ if-not-else = "allow"
 needless-pass-by-value = "allow"
 inline-always = "allow"
 needless-continue = "allow"
+missing-panics-doc = "allow"
