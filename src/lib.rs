@@ -24,6 +24,9 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::ptr::NonNull;
+#[allow(unused_imports, reason = "used in docs")]
+#[allow(clippy::disallowed_types, reason = "only used for docs")]
+use std::sync::Arc;
 
 mod runtime;
 
@@ -55,6 +58,13 @@ impl LayoutInfo {
 
 /// A thread-safe reference counted object,
 /// biased towards a particular thread.
+///
+/// # Differences from [`Arc`]
+/// Most differences come from the fact that [`Self::strong_count`] is not exact.
+/// This means that [`Brc::get_mut`] and [`Brc::try_unwrap`] can fail spuriously
+/// even if the [`Arc`] is logically unique.
+/// It also means that [`Brc::into_inner`] cannot provide the same guarantees as [`Arc::into_inner`].
+#[repr(transparent)] // can be transmuted into a pointer
 pub struct Brc<T: ?Sized + SupportedPointee> {
     ptr: NonNull<T>,
     marker: PhantomData<T>,
@@ -74,6 +84,61 @@ impl<T> Brc<T> {
         // SAFETY: Either we fully initialize the newly allocated memory,
         // or the initialization function panics
         unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(func())) }
+    }
+
+    /// If the [`Brc`] is uniquely owned,
+    /// return the inner value.
+    ///
+    /// Like [`Self::get_mut`], this may fail spuriously
+    /// (as [`Self::is_unique`] can have false positive).
+    ///
+    /// This suffers from the same race condition described in [`Arc::try_unwrap`].
+    /// In particular, this means that if all threads call [`Arc::try_unwrap`],
+    /// it is possible that the value is dropped and no thread gets the value.
+    /// Unfortunately, there is no solution
+    ///
+    /// # Errors
+    /// Returns an `Err` holding the original value,
+    /// if the value is not known to be unique.
+    #[inline]
+    pub fn try_unwrap(this: Self) -> Result<T, Self>
+    where
+        T: Sized,
+    {
+        let this = ManuallyDrop::new(this);
+        if Self::is_unique(&*this) {
+            // SAFETY: We are unique, so can move out of the value
+            Ok(unsafe { core::ptr::from_ref::<T>(&**this).read() })
+        } else {
+            Err(ManuallyDrop::into_inner(this))
+        }
+    }
+
+    /// If the [`Brc`] is uniquely owned,
+    /// return the inner value.
+    ///
+    /// Like [`Self::get_mut`], this may fail spuriously
+    /// (as [`Self::is_unique`] can have false positive).
+    ///
+    /// Unlike [`Arc::into_inner`],
+    /// this does not currently avoid the race condition present in [`Self::try_unwrap`].
+    /// This means that if all threads call [`Arc::try_unwrap`],
+    /// it is possible that the value is dropped and no thread gets the value.
+    ///
+    /// This is because [`Self::strong_count`] is not always exact,
+    /// and dropping from the non-biased thread sometimes requires placing
+    /// objects in the internal queue.
+    /// In particular, if many refcounts are incremented on the biased threads,
+    /// but then have [`Self::into_inner`] called on a non-biased thread,
+    /// then the non-biased thread will not know when the value actually becomes unique,
+    /// and will have to wait until the object is placed in the queue and later processed.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "don't want to conflict with inherent methods"
+    )]
+    #[inline]
+    pub fn into_inner(this: Self) -> Option<T> {
+        Self::try_unwrap(this).ok()
     }
 }
 impl<T> Brc<[T]> {
