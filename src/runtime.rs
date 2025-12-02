@@ -92,11 +92,9 @@ impl RawBrcHeader {
     /// This is a safe operation for the same reason that [`std::mem::forget`] is.
     #[inline]
     pub fn increment_strong(&self) {
-        nounwind::abort_unwind(|| {
-            if self.attempt_fast_increment().is_err() {
-                self.slow_increment();
-            }
-        });
+        if self.attempt_fast_increment().is_err() {
+            self.slow_increment();
+        }
     }
 
     /// Attempt to determine the number of strong references,
@@ -176,22 +174,24 @@ impl RawBrcHeader {
     #[cold]
     #[inline(never)]
     fn slow_increment(&self) {
-        self.shared_word
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-                let old = SharedWord::from_raw(old);
-                let new_count = old
-                    .shared_count
-                    .checked_add(i30::new(1))
-                    .expect("refcnt overflow");
-                Some(
-                    SharedWord {
-                        shared_count: new_count,
-                        ..old
-                    }
-                    .to_raw(),
-                )
-            })
-            .unwrap();
+        nounwind::abort_unwind(|| {
+            self.shared_word
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+                    let old = SharedWord::from_raw(old);
+                    let new_count = old
+                        .shared_count
+                        .checked_add(i30::new(1))
+                        .expect("refcnt overflow");
+                    Some(
+                        SharedWord {
+                            shared_count: new_count,
+                            ..old
+                        }
+                        .to_raw(),
+                    )
+                })
+                .unwrap();
+        });
     }
 
     /// Decrement the object's strong count,
