@@ -42,6 +42,13 @@ fn alloc_with_clone() {
     drop(two);
 }
 
+#[test]
+fn alloc_from_box() {
+    let one: Box<str> = Box::from("hello");
+    let one: Brc<str> = Brc::from(one);
+    assert_eq!(one.as_ref(), "hello");
+}
+
 #[derive(thiserror::Error, Debug)]
 #[error("{msg}")]
 struct SimpleError {

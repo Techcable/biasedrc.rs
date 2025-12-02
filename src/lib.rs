@@ -518,6 +518,31 @@ impl<T> From<T> for Brc<T> {
         Brc::new(value)
     }
 }
+/// Convert from a [`Box`] to a [`Brc`].
+///
+/// This conversion is guaranteed not to copy values to the stack,
+/// which means large values cannot trigger stack overflow.
+///
+/// However, this cannot reuse the allocation as a [`Box`] has no room to hold the reference count.
+impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
+    #[inline]
+    fn from(value: Box<T>) -> Self {
+        let meta = ptr_meta::metadata(&raw const *value);
+        let layout = Layout::for_value::<T>(&*value);
+        // SAFETY: Fully initializes the value by copying from the Box.
+        // Can only fail if the allocation does
+        unsafe {
+            Self::alloc_with(layout, meta, move |dest| {
+                let value = ManuallyDrop::new(value);
+                dest.cast::<u8>().copy_from_nonoverlapping(
+                    core::ptr::from_ref::<T>(&**value).cast::<u8>(),
+                    layout.size(),
+                );
+                drop(ManuallyDrop::into_inner(value));
+            })
+        }
+    }
+}
 impl<T: Clone> From<&[T]> for Brc<[T]> {
     fn from(src: &[T]) -> Self {
         let layout = Layout::for_value(src);
