@@ -219,8 +219,6 @@ pub struct LocalThreadState {
     /// This has the logical lifetime `&'self`,
     /// but we use a pointer since that is not currently possible to express.
     _cached_queue: NonNull<ObjectQueue>,
-    /// Counter to control how often [`Self::cleanup`] is performed.
-    cleanup_counter: Cell<u32>,
 }
 impl LocalThreadState {
     #[inline]
@@ -234,7 +232,7 @@ impl LocalThreadState {
     ///
     /// There is a potential race if the destructor of [`LocalThreadState`]
     /// is invoked while the closure is running,
-    /// as [`THIS_THREAD_STATE_FLAG`] would be invalidated.
+    /// as [`THIS_THREAD_STATE_FAST`] would be invalidated.
     ///
     /// This case cannot actually happen,
     /// as if the thread is live at the beginning of the closure,
@@ -267,61 +265,51 @@ impl LocalThreadState {
     /// or an error if the local thread is uninitialized or invalid (cannot participate in BRC)
     #[inline]
     pub fn existing_short_id() -> Result<ShortThreadId, LocalThreadAccessError> {
-        match THIS_THREAD_STATE_FLAG.get() {
-            LocalThreadStateFlag::Uninit => Err(LocalThreadAccessError::Uninitialized),
-            LocalThreadStateFlag::DeadOrDying => Err(LocalThreadAccessError::Dead),
-            LocalThreadStateFlag::Active { short_id } => Ok(short_id),
+        match THIS_THREAD_STATE_FAST.with(|fast| (fast.status.get(), fast.short_id.get())) {
+            (LocalThreadStatus::Uninit, None) => Err(LocalThreadAccessError::Uninitialized),
+            (LocalThreadStatus::DeadOrDying, None) => Err(LocalThreadAccessError::Dead),
+            (LocalThreadStatus::Active, Some(short_id)) => Ok(short_id),
+            (_, Some(_)) | (LocalThreadStatus::Active, None) => {
+                // SAFETY: Thread state is invalid
+                unsafe { core::hint::unreachable_unchecked() }
+            }
         }
     }
-    /// How often [`Self::collect`] actually needs to check the queue.
-    ///
-    /// This counter exists to avoid frequent calls into [`Self::collect_slow`].
-    /// It prevents a scenario where other threads are slowly added objects to the queue one by one,
-    /// where [`Self::collect_slow`] is called each time and only one item is processed.
-    /// It is better to wait a little bit and batch the processing together.
-    const COLLECT_FREQUENCY: u32 = 8;
 
-    /// Perform thread-local cleanup operations if deemed necessary.
-    ///
-    /// Similar to [`crate::runtime::collect`] but avoids a TLS access.
-    ///
-    /// The collection heuristics in this function and [`Self::collect_slow`]
-    /// are very crude and have not been benchmarked.
-    /// Improvements and benchmarks are welcome.
     #[inline]
-    pub(crate) fn collect(&self) {
-        // The cleanup counter provides protection against doing cleanup operations too often.
-        // Each call to `collect_force` is slow, as it requires acquiring a lock
-        if self.cleanup_counter.get() >= Self::COLLECT_FREQUENCY {
-            self.collect_slow();
-        }
-        // don't really care about overflow here as its almost impossible,
-        // and will simply delay collection by `COLLECT_FREQUENCY` if it happens
-        self.cleanup_counter
-            .set(self.cleanup_counter.get().wrapping_add(1));
+    pub fn currently_needs_collect() -> bool {
+        THIS_THREAD_STATE_FAST.with(|fast| {
+            // compiles to copmarison against zero
+            !matches!(
+                fast.shared_state_flag.get().load(Ordering::Relaxed),
+                ThreadStateFlag::Live
+            )
+        })
     }
 
-    /// The slow path for [`Self::COLLECT`], called every one in [`Self::COLLECT_FREQUENCY`] times.
+    /// The slow path for [`crate::collect`].
     ///
     /// This is a separate function to indicate that it is a cold path and to favor outlining.
-    /// We do not mark it as `#[inline(never)]`,
-    /// as it is relatively small and inlining may be profitable in some cases.
     #[cold]
-    fn collect_slow(&self) {
-        nounwind::abort_unwind(|| {
-            if std::thread::panicking() {
-                // skip collection if we are panicking (helpful if called by Drop)
-                return;
-            }
-            // This match compiles into a comparison against zero
-            if !matches!(
-                self.shared_info.state_flag.load(Ordering::Relaxed),
-                ThreadStateFlag::Live
-            ) {
-                // we don't really need to worry about lock contention here,
-                // because it should only be write-locked if the thread is dying
-                self.collect_force();
-            }
+    #[inline(never)]
+    pub(super) fn collect_slow() {
+        // we ignore any access error
+        let _ = Self::with_current(|state| {
+            nounwind::abort_unwind(|| {
+                if std::thread::panicking() {
+                    // skip collection if we are panicking (helpful if called by Drop)
+                    return;
+                }
+                // This match compiles into a comparison against zero
+                if !matches!(
+                    state.shared_info.state_flag.load(Ordering::Relaxed),
+                    ThreadStateFlag::Live
+                ) {
+                    // we don't really need to worry about lock contention here,
+                    // because it should only be write-locked if the thread is dying
+                    state.collect_force();
+                }
+            });
         });
     }
 
@@ -347,12 +335,14 @@ impl LocalThreadState {
 }
 impl Drop for LocalThreadState {
     fn drop(&mut self) {
-        assert_eq!(
-            THIS_THREAD_STATE_FLAG.replace(LocalThreadStateFlag::DeadOrDying),
-            LocalThreadStateFlag::Active {
-                short_id: self.short_id
-            }
-        );
+        THIS_THREAD_STATE_FAST.with(|fast| {
+            assert_eq!(
+                fast.status.replace(LocalThreadStatus::DeadOrDying),
+                LocalThreadStatus::Active,
+            );
+            assert_eq!(fast.short_id.replace(None), Some(self.short_id));
+            fast.shared_state_flag.set(&DUMMY_STATE_FLAG);
+        });
         // now attempt to destroy the thread
         match self.shared_info.shared_state.try_write() {
             Some(mut success) => {
@@ -376,10 +366,12 @@ impl Drop for LocalThreadState {
         }
     }
 }
-/// The "fast" version of [`LocalThreadState`],
-/// which does not require a destructor.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum LocalThreadStateFlag {
+/// The status of the local thread state.
+///
+/// Stored in the [`ThreadStateFlag`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, bytemuck::NoUninit)]
+#[repr(u8)]
+enum LocalThreadStatus {
     /// Indicates that the thread is dead or being destroyed.
     DeadOrDying,
     /// Indicates that the thread has not been fully initialized yet.
@@ -387,19 +379,37 @@ enum LocalThreadStateFlag {
     /// This can happen because the [`THIS_THREAD_STATE`] TLS hasn't been lazy-initialized yet,
     /// or because there is an [`ThreadIdOverflowError`].
     Uninit,
-    Active {
-        short_id: ShortThreadId,
-    },
+    Active,
+}
+
+static DUMMY_STATE_FLAG: Atomic<ThreadStateFlag> = Atomic::new(ThreadStateFlag::Dying);
+/// The "fast" version of [`LocalThreadState`],
+/// which does not require a destructor or initializer.
+#[derive(Debug)]
+pub struct LocalThreadStateFast {
+    status: Cell<LocalThreadStatus>,
+    short_id: Cell<Option<ShortThreadId>>,
+    /// A reference to the thread state flag stored in the [`SharedThreadState`].
+    ///
+    /// Used to tell if collection needs to be performed.
+    ///
+    /// If the thread is destroyed or uninitialized, this will be set to [`DUMMY_STATE_FLAG`].
+    shared_state_flag: Cell<&'static Atomic<ThreadStateFlag>>,
 }
 thread_local! {
     /// Information on this thread's participation in biased reference counting.
     static THIS_THREAD_STATE: Result<LocalThreadState, ThreadStateInitError> = nounwind::abort_unwind(init_thread);
     /// A more basic version of [`LocalThreadState`] which is `Copy` and const-initialized.
     ///
-    /// The primary purpose is to prevent [`THIS_THREAD_STATE`] from being re-initialized after destruction,
-    /// As a secondary benefit,
-    /// it gives faster access to the [`ShortThreadId`] without going through a lazy-init check.
-    static THIS_THREAD_STATE_FLAG: Cell<LocalThreadStateFlag> = const { Cell::new(LocalThreadStateFlag::Uninit) };
+    /// The most important purpose is to prevent [`THIS_THREAD_STATE`] from being re-initialized after destruction,
+    /// by storing the [`LocalThreadStatus`].
+    /// It gives faster access to the [`ShortThreadId`] and the ``needs_collect` flag
+    /// without going through a lazy-init check.
+    static THIS_THREAD_STATE_FAST: LocalThreadStateFast = const { LocalThreadStateFast {
+        status: Cell::new(LocalThreadStatus::Uninit),
+        short_id: Cell::new(None),
+        shared_state_flag: Cell::new(&DUMMY_STATE_FLAG),
+    } };
 }
 /// If this is true, we have run out of valid thread ids.
 ///
@@ -409,15 +419,16 @@ static THREADS: boxcar::Vec<Result<&'static SharedThreadInfo, ThreadIdOverflowEr
     boxcar::Vec::new();
 
 fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
-    match THIS_THREAD_STATE_FLAG.get() {
-        LocalThreadStateFlag::DeadOrDying => {
+    let old_status = THIS_THREAD_STATE_FAST.with(|fast| fast.status.get());
+    match old_status {
+        LocalThreadStatus::DeadOrDying => {
             // this can happen if the TLS is destroyed then re-initialized.
             // We do not want to deal with this scenario as we may have transferred ownership.
             return Err(ThreadStateInitError::AlreadyDied);
         }
-        LocalThreadStateFlag::Uninit => {} // exactly as expected
-        old_state @ LocalThreadStateFlag::Active { .. } => {
-            panic!("Thread already initialized with state {old_state:?}")
+        LocalThreadStatus::Uninit => {} // exactly as expected
+        LocalThreadStatus::Active => {
+            panic!("Thread already initialized")
         }
     }
     if SHORT_THREAD_IDS_EXHAUSTED.load(Ordering::Acquire) {
@@ -443,16 +454,23 @@ fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
         });
         let shared_info = THREADS[index]?;
         assert_eq!(
-            THIS_THREAD_STATE_FLAG.replace(LocalThreadStateFlag::Active {
-                short_id: shared_info.short_id
+            THIS_THREAD_STATE_FAST.with(|fast| {
+                (
+                    core::ptr::from_ref(fast.shared_state_flag.replace(&shared_info.state_flag)),
+                    fast.status.replace(LocalThreadStatus::Active),
+                    fast.short_id.replace(Some(shared_info.short_id)),
+                )
             }),
-            LocalThreadStateFlag::Uninit
+            (
+                core::ptr::from_ref(&DUMMY_STATE_FLAG),
+                LocalThreadStatus::Uninit,
+                None
+            )
         );
         Ok(LocalThreadState {
             shared_info,
             short_id: shared_info.short_id,
             _cached_queue: cached_queue,
-            cleanup_counter: Cell::new(0),
         })
     }
 }

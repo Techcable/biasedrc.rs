@@ -596,9 +596,9 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
 /// Will never panic, but may abort if internal state is irreparably corrupted.
 #[inline]
 pub fn collect() {
-    // This always costs a TLS lookup, which can be relatively expensive
-    // If queuing is rare enough it might make sense to add a global flag
-    let _ = LocalThreadState::with_current(LocalThreadState::collect);
+    if LocalThreadState::currently_needs_collect() {
+        LocalThreadState::collect_slow();
+    }
 }
 
 /// Forcibly perform the [`cleanup`] operation, regardless of internal heuristics.
