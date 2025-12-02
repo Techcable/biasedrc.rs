@@ -155,7 +155,6 @@ impl SharedThreadInfo {
     unsafe fn do_destroy_shared(&self, lock: &mut RwLockWriteGuard<'_, SharedThreadState>) {
         match &**lock {
             SharedThreadState::Live { queued_objects } => {
-                THIS_THREAD_STATE_FLAG.set(LocalThreadStateFlag::DeadOrDying);
                 // SAFETY: We are either directly executing in a destructure on the biased thread,
                 // or the destructor has already finished and flagged a request to be killed,
                 // and our write access to the state lock gives us the exclusive permission to finish the cleanup.
