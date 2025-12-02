@@ -29,7 +29,7 @@ mod runtime;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 
-pub use crate::runtime::{collect, collect_force};
+pub use crate::runtime::{ImpreciseRefCountError, collect, collect_force};
 
 struct LayoutInfo {
     value_offset: isize,
@@ -63,8 +63,17 @@ impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
-        // SAFETY: We fully initialize the newly allocated memory
-        unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(value)) }
+        Self::new_with(|| value)
+    }
+
+    /// Construct a new [`Brc`], using a closure to initialize the specified value.
+    ///
+    /// This can potentially improve performance by allowing values to be constructed in place.
+    #[inline]
+    pub fn new_with(func: impl FnOnce() -> T) -> Self {
+        // SAFETY: Either we fully initialize the newly allocated memory,
+        // or the initialization function panics
+        unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(func())) }
     }
 }
 impl<T> Brc<[T]> {
@@ -201,6 +210,92 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         }
     }
 
+    /// Return the number of strong references to the object,
+    /// or an error if that value cannot be pricelessly determined.
+    ///
+    /// If this thread is the biased thread,
+    /// then it can always determine the true reference count.
+    /// If it is not the biased thread,
+    /// then it can only approximate the value.
+    ///
+    /// # Errors
+    /// Gives an [`ImpreciseRefCountError`] if not on the biased thread,
+    /// and the true reference count cannot be determined.
+    #[inline]
+    pub fn strong_count(this: &Self) -> Result<usize, ImpreciseRefCountError> {
+        this.header().strong_count()
+    }
+
+    /// Determine if this [`Brc`] is uniquely owned.
+    ///
+    /// Due to the nature of biased reference counting,
+    /// this may have false-negatives when called on a non-biased thread.
+    /// However, it will never have false positives.
+    /// See [`Self::strong_count`] for details.
+    #[inline]
+    pub fn is_unique(this: &Self) -> bool {
+        this.header().is_unique()
+    }
+
+    /// Return a mutable reference to the value in this [`Brc`],
+    /// unsafely assuming if it is uniquely owned.
+    ///
+    /// See also [`Self::get_mut`] which clones the value instead of returning `None`.
+    ///
+    /// # Safety
+    /// This is safe if [`Self::is_unique`] returns true,
+    /// but due to false negatives from this function may be true in other cases.
+    ///
+    /// Trigger immediate undefined behavior if there are any other references to the inner value,
+    /// as a `&mut T` reference must always be unique.
+    #[inline]
+    pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
+        // SAFETY: Caller guarantees this is valid
+        unsafe { this.ptr.as_mut() }
+    }
+
+    /// Return a mutable reference to the value in this [`Brc`],
+    /// or `None` if it is not uniquely owned.
+    ///
+    /// This may fail spuriously on a non-biased thread,
+    /// due to inability to determine the true value of the reference count.
+    /// In other words, [`Self::is_unique`] has false negatives.
+    ///
+    /// See also [`Self::make_mut`] which clones the value instead of returning `None`.
+    #[inline]
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if Self::is_unique(this) {
+            // SAFETY: Uniqueness makes this is safed
+            unsafe { Some(Self::get_mut_unchecked(this)) }
+        } else {
+            None
+        }
+    }
+
+    /// Return a mutable reference to this [`Brc`] if it is uniquely owned,
+    /// or `Clone` it to make it unique otherwise.
+    ///
+    /// May `Clone` the value unnecessarily if uniqueness
+    /// can not be guaranteed by [`Self::is_unique`].
+    ///
+    /// See also [`Self::get_mut`] which returns `None` instead of cloning the value.
+    /// This mirrors the [`Arc::make_mut`] method, but may involve m
+    #[inline]
+    pub fn make_mut(this: &mut Self) -> &mut T
+    where
+        T: Clone,
+    {
+        if Self::is_unique(this) {
+            // SAFETY: Uniqueness makes this is safe
+            unsafe { Self::get_mut_unchecked(this) }
+        } else {
+            let value = &**this;
+            *this = Self::new_with(|| T::clone(value));
+            // SAFETY: We have ensured the reference is unique
+            unsafe { Self::get_mut_unchecked(this) }
+        }
+    }
+
     /// Convert this [`Brc`] into a raw pointer,
     /// similar to [`std::sync::Arc::into_raw`].
     ///
@@ -222,6 +317,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         // SAFETY: Cannot overflow since the value has already been allocated
         unsafe { LayoutInfo::new(this_layout).unwrap_unchecked() }
     }
+
     #[inline]
     fn header(&self) -> &RawBrcHeader {
         let header_offset = self.layout().header_offset();

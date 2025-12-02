@@ -111,3 +111,30 @@ fn multithread_requires_merge() {
         biasedrc::collect_force();
     });
 }
+
+#[test]
+fn get_mut() {
+    {
+        let mut one = Brc::new(42);
+        assert_eq!(*Brc::get_mut(&mut one).unwrap(), 42);
+    }
+    {
+        let one = Brc::new(42);
+        let mut two = Brc::clone(&one);
+        assert_eq!(Brc::get_mut(&mut two), None);
+    }
+    {
+        let one = Brc::new(42);
+        std::thread::scope(move |scope| {
+            scope.spawn(move || {
+                let mut two = Brc::clone(&one);
+                drop(one);
+                assert_eq!(
+                    Brc::get_mut(&mut two),
+                    None,
+                    "Calling get_mut should fail on non-biased thread"
+                );
+            });
+        });
+    }
+}

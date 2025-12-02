@@ -11,6 +11,14 @@ use std::sync::atomic::Ordering;
 
 mod threads;
 
+/// An error returned by [`Brc::strong_count`](crate::Brc::strong_count)
+/// if the reference count cannot be precisely determined.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Imprecise reference count due to biased thread (lower bound is {lower_bound})")]
+pub struct ImpreciseRefCountError {
+    lower_bound: usize,
+}
+
 /// The object header for a [`Brc`].
 ///
 /// Separated from the [`Brc`] to allow more detailed control of allocation.
@@ -89,6 +97,57 @@ impl RawBrcHeader {
                 self.slow_increment();
             }
         });
+    }
+
+    /// Attempt to determine the number of strong references,
+    /// returning an error if it cannot be precisely determined.
+    #[inline]
+    pub fn strong_count(&self) -> Result<usize, ImpreciseRefCountError> {
+        let this_thread_id = LocalThreadState::existing_short_id().ok();
+        let shared_word = SharedWord::from_raw(self.shared_word.load(Ordering::Acquire));
+        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+        if shared_word.merged {
+            debug_assert!(shared_word.shared_count.value() > 0, "{shared_word:?}");
+            let res = shared_word.shared_count.value();
+            debug_assert!(res >= 0, "bad merged refcount {res:?}");
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "Reference count should be nonnegative for merged threads"
+            )]
+            Ok(res as usize)
+        } else if biased_word.owner_id == this_thread_id {
+            let (sum_count, overflow) = u32::from(biased_word.biased_count)
+                .overflowing_add_signed(shared_word.shared_count.value());
+            debug_assert!(
+                !overflow,
+                "Sum overflows for {shared_word:?} + {biased_word:?}"
+            );
+            Ok(sum_count as usize)
+        } else {
+            // We are not the owning thread, and the RCs have not been merged,
+            // so we cannot know the true value of the reference counting.
+            // However, since the biased count is always nonnegative,
+            // we do have a lower bound.
+            #[expect(clippy::cast_sign_loss, reason = "Ensured nonnegative before casting")]
+            Err(ImpreciseRefCountError {
+                lower_bound: shared_word.shared_count.value().max(0) as usize,
+            })
+        }
+    }
+
+    /// Attempt to determine if the reference count is unique.
+    ///
+    /// May have false negatives if not on the biased thread,
+    /// but will never have false positives.
+    ///
+    /// # Panics
+    /// If internal invariants are invalidated, this may panic.
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        match self.strong_count() {
+            Ok(count) => count == 1,
+            Err(ImpreciseRefCountError { .. }) => false, // be conservative
+        }
     }
 
     #[inline]
@@ -441,7 +500,11 @@ impl BiasedWord {
 #[derive(Copy, Clone, Debug)]
 struct SharedWord {
     shared_count: i30,
+    /// This is set by the owner thread when it has merged the shared and biased counters.
+    ///
+    /// Once this is set, the reference count will never be biased again.
     merged: bool,
+    /// Requests the owner thread to merge the reference counters,
     queued: bool,
 }
 impl SharedWord {
