@@ -31,6 +31,18 @@ criterion = "0.8"
 name = "basic"
 harness = false
 
+[[bench]]
+name = "rpds_hash_trie_map"
+harness = false
+
+[[bench]]
+name = "rpds_hash_trie_map_brc"
+harness = false
+
+[[bench]]
+name = "rpds_hash_trie_map_sync"
+harness = false
+
 [profile.bench]
 debug = true
 
