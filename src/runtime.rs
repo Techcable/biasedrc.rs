@@ -63,7 +63,7 @@ impl RawBrcHeader {
             Some(this_id) => RawBrcHeader {
                 biased_word: AtomicU32::new(
                     BiasedWord {
-                        biased_count: u14::new(1),
+                        biased_count: u20::new(1),
                         owner_id: Some(this_id),
                     }
                     .to_raw(),
@@ -153,7 +153,7 @@ impl RawBrcHeader {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         let incremented_counter = biased_word
             .biased_count
-            .checked_add(u14::new(1))
+            .checked_add(u20::new(1))
             .ok_or(FastIncrementFailure)?;
         let this_id = LocalThreadState::existing_short_id().map_err(|_| FastIncrementFailure)?;
         if biased_word.owner_id == Some(this_id) {
@@ -243,7 +243,7 @@ impl RawBrcHeader {
             debug_assert_ne!(biased_word.biased_count.value(), 0);
             // SAFETY: Caller guarantees that refcnt > 0
             let new_biased_count =
-                unsafe { u14::new_unchecked(biased_word.biased_count.value().unchecked_sub(1)) };
+                unsafe { u20::new_unchecked(biased_word.biased_count.value().unchecked_sub(1)) };
             // can just update the reference count
             if new_biased_count.value() > 0 {
                 // store updated reference count
@@ -353,7 +353,7 @@ impl RawBrcHeader {
             // SAFETY: Queued object is
             match unsafe {
                 threads::SharedThreadInfo::get_by_id(owner_id)
-                    .expect("owner thread info is undefined")
+                    .unwrap_or_else(|| panic!("thread info for owner {owner_id:?} is undefined"))
                     .queue_object(QueuedObject {
                         header_ptr: NonNull::from(self),
                         drop: drop.clone(),
@@ -477,23 +477,25 @@ pub struct ErasedDestructorContext(pub *mut c_void);
 #[derive(Copy, Clone, Debug)]
 struct BiasedWord {
     owner_id: Option<ShortThreadId>,
-    biased_count: u14,
+    biased_count: u20,
 }
 impl BiasedWord {
     const UNOWNED: BiasedWord = BiasedWord {
         owner_id: None,
-        biased_count: u14::ZERO,
+        biased_count: u20::ZERO,
     };
     #[inline]
     fn to_raw(self) -> u32 {
-        ((self.biased_count.value() as u32) << ShortThreadId::BITS)
-            | (self.owner_id.map_or(0, |value| value.value().value()))
+        ((self.biased_count.value()) << ShortThreadId::BITS)
+            | (self
+                .owner_id
+                .map_or(0, |value| value.value().value() as u32))
     }
     #[inline]
     fn from_raw(raw: u32) -> Self {
         BiasedWord {
-            owner_id: ShortThreadId::new(arbitrary_int::u18::masked_new(raw)),
-            biased_count: arbitrary_int::u14::masked_new(raw >> ShortThreadId::BITS),
+            owner_id: ShortThreadId::new(arbitrary_int::u12::masked_new(raw)),
+            biased_count: arbitrary_int::u20::masked_new(raw >> ShortThreadId::BITS),
         }
     }
 }
@@ -546,7 +548,8 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     loop {
         assert!(!old_word.merged);
         #[expect(clippy::cast_possible_wrap, reason = "an u14 fits in an i16")]
-        let biased_count = i30::from(biased.biased_count.value() as i16);
+        // SAFETY: We know a u20 fits in a i32
+        let biased_count = unsafe { i30::new_unchecked(biased.biased_count.value() as i32) };
         new_word = SharedWord {
             shared_count: old_word
                 .shared_count
@@ -577,7 +580,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
         header.biased_word.store(
             BiasedWord {
                 owner_id: None,
-                biased_count: u14::ZERO,
+                biased_count: u20::ZERO,
             }
             .to_raw(),
             Ordering::Relaxed,

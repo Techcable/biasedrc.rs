@@ -6,7 +6,7 @@ use core::sync::atomic::AtomicBool;
 use crossbeam_queue::SegQueue;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::cell::Cell;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::thread::AccessError;
@@ -512,26 +512,26 @@ pub enum LocalThreadAccessError {
 /// with the zero value reserved.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct ShortThreadId(NonZeroU32);
+pub struct ShortThreadId(NonZeroU16);
 impl ShortThreadId {
-    pub const BITS: u32 = 18;
-    pub const MAX: u18 = u18::MAX;
+    pub const BITS: u32 = 12;
+    pub const MAX: u12 = u12::MAX;
 
     #[inline]
-    pub const fn new(x: u18) -> Option<Self> {
+    pub const fn new(x: u12) -> Option<Self> {
         // NOTE: Cannot use ? in const fn
         if x.value() != 0 {
             // SAFETY: Just checked to be nonzero
-            Some(unsafe { ShortThreadId(NonZeroU32::new_unchecked(x.value())) })
+            Some(unsafe { ShortThreadId(NonZeroU16::new_unchecked(x.value())) })
         } else {
             None
         }
     }
 
     #[inline]
-    pub const fn value(self) -> u18 {
-        // SAFETY: Known to fit into 18 bits
-        unsafe { u18::new_unchecked(self.0.get()) }
+    pub const fn value(self) -> u12 {
+        // SAFETY: Known to fit into 12 bits
+        unsafe { u12::new_unchecked(self.0.get()) }
     }
 
     #[inline]
@@ -545,7 +545,7 @@ impl TryFrom<UniqueThreadId> for ShortThreadId {
 
     #[inline]
     fn try_from(value: UniqueThreadId) -> Result<Self, Self::Error> {
-        let value = NonZeroU32::try_from(value.0).map_err(|_| ThreadIdOverflowError)?;
+        let value = NonZeroU16::try_from(value.0).map_err(|_| ThreadIdOverflowError)?;
         if value.get() <= Self::MAX.value() {
             Ok(ShortThreadId(value))
         } else {
