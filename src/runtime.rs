@@ -175,8 +175,9 @@ impl RawBrcHeader {
     #[inline(never)]
     fn slow_increment(&self) {
         nounwind::abort_unwind(|| {
+            // safe to use a relaxed CAS here, as justified in Arc::clone
             self.shared_word
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                     let old = SharedWord::from_raw(old);
                     let new_count = old
                         .shared_count
