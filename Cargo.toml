@@ -23,6 +23,17 @@ ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = fa
 unsize = "1.1"
 archery = "1"
 
+[dev-dependencies]
+rpds = "1.2"
+criterion = "0.8"
+
+[[bench]]
+name = "basic"
+harness = false
+
+[profile.bench]
+debug = true
+
 [features]
 # Use the nightly pointer metadata feature instead of the stable one
 #
