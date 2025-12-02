@@ -21,6 +21,7 @@ stable_deref_trait = "1.2"
 # Emulate the ptr_metadata unstable feature on stable rust
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 unsize = "1.1"
+archery = "1"
 
 [features]
 # Use the nightly pointer metadata feature instead of the stable one
