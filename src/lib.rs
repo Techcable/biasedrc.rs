@@ -408,9 +408,7 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
 impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
     #[inline]
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            collect();
-        }
+        collect();
         let value: &T = self.deref();
         let context = DropContext::<T> {
             metadata: ptr_meta::metadata(value),

@@ -309,6 +309,10 @@ impl LocalThreadState {
     #[cold]
     fn collect_slow(&self) {
         nounwind::abort_unwind(|| {
+            if std::thread::panicking() {
+                // skip collection if we are panicking (helpful if called by Drop)
+                return;
+            }
             // This match compiles into a comparison against zero
             if !matches!(
                 self.shared_info.state_flag.load(Ordering::Relaxed),
