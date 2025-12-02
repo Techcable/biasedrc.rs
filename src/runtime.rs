@@ -555,10 +555,11 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             merged: true,
             ..old_word
         };
+        // since we branch on the result, I don't think that Relaxed ordering is safe
         match header.shared_word.compare_exchange_weak(
             old_word.to_raw(),
             new_word.to_raw(),
-            Ordering::Relaxed,
+            Ordering::AcqRel,
             Ordering::Relaxed,
         ) {
             Ok(_) => break,
