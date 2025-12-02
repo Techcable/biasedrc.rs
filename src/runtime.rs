@@ -277,25 +277,20 @@ impl RawBrcHeader {
     /// Assumes that this thread is the owner of the object,
     /// and that it is still "biased".
     #[cold]
-    #[inline(never)]
+    #[inline(never)] // inlining this seems to harm performance
     unsafe fn fast_decrement_slow<D: DropInfo>(&self, drop: D) {
-        let new = SharedWord::from_raw(
+        let old_shared = SharedWord::from_raw(
             self.shared_word
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-                    let old = SharedWord::from_raw(old);
-                    debug_assert!(!old.merged);
-                    Some(
-                        SharedWord {
-                            merged: old.merged,
-                            ..old
-                        }
-                        .to_raw(),
-                    )
-                })
-                .unwrap(),
+                .fetch_or(SharedWord::MERGED_BIT, Ordering::AcqRel),
         );
-        debug_assert!(new.shared_count.value() >= 0);
-        if new.shared_count.value() == 0 {
+        debug_assert!(!old_shared.merged);
+        // only change is the addition of the merge bit
+        let new_shared = SharedWord {
+            merged: true,
+            ..old_shared
+        };
+        debug_assert!(new_shared.shared_count.value() >= 0);
+        if new_shared.shared_count.value() == 0 {
             let header_ptr = NonNull::from(self);
             // SAFETY: The pointer is valid, and it is time to deallocate
             unsafe { drop.dealloc(header_ptr) }
@@ -511,6 +506,8 @@ struct SharedWord {
     queued: bool,
 }
 impl SharedWord {
+    const MERGED_BIT: u32 = 1 << 30;
+    const QUEUED_BIT: u32 = 1 << 31;
     #[inline]
     fn to_raw(self) -> u32 {
         self.shared_count.to_bits() | ((self.merged as u32) << 30) | ((self.queued as u32) << 31)
@@ -519,8 +516,8 @@ impl SharedWord {
     fn from_raw(raw: u32) -> Self {
         SharedWord {
             shared_count: i30::masked_new(raw),
-            merged: (raw & (1 << 30)) != 0,
-            queued: (raw & (1 << 31)) != 0,
+            merged: (raw & Self::MERGED_BIT) != 0,
+            queued: (raw & Self::QUEUED_BIT) != 0,
         }
     }
 }
