@@ -210,6 +210,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// Callback must either fully initialize the memory or panic.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
     unsafe fn alloc_with(layout: Layout, meta: T::Metadata, func: impl FnOnce(*mut T)) -> Brc<T> {
+        #[cfg(not(no_implicit_collect))]
         collect();
         #[cold]
         #[inline(never)]
@@ -408,6 +409,7 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
 impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(not(no_implicit_collect))]
         collect();
         let value: &T = self.deref();
         let context = DropContext::<T> {
@@ -422,6 +424,7 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
     #[inline]
     fn clone(&self) -> Self {
+        #[cfg(not(no_implicit_collect))]
         collect();
         self.header().increment_strong();
         // SAFETY: Just successfully incremented the refcnt
