@@ -172,27 +172,12 @@ impl RawBrcHeader {
     }
 
     #[cold]
-    #[inline(never)]
     fn slow_increment(&self) {
-        nounwind::abort_unwind(|| {
-            // safe to use a relaxed CAS here, as justified in Arc::clone
-            self.shared_word
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    let old = SharedWord::from_raw(old);
-                    let new_count = old
-                        .shared_count
-                        .checked_add(SharedCount::new(1))
-                        .expect("refcnt overflow");
-                    Some(
-                        SharedWord {
-                            shared_count: new_count,
-                            ..old
-                        }
-                        .to_raw(),
-                    )
-                })
-                .unwrap();
-        });
+        // safe to use a relaxed CAS here, as justified in Arc::clone
+        let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
+        if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {
+            nounwind::abort_unwind(|| panic!("Refcount overflow"));
+        }
     }
 
     /// Decrement the object's strong count,
@@ -516,6 +501,18 @@ struct SharedWord {
 impl SharedWord {
     const MERGED_BIT: u32 = 1 << SharedCount::BITS;
     const QUEUED_BIT: u32 = 1 << (SharedCount::BITS + 1);
+    /// The threshold past which a reference count should be considered to have overflown.
+    ///
+    /// This is checked against the result of calling [`fetch_add`] to check for overflow.
+    /// Use of `fetch_add` is noticeably faster than calling [`checked_add`] in a CAS loop,
+    /// but comes with the risk of the `fetch_add`
+    /// overflowing and then the thread going to sleep before the panic can occur.
+    /// If enough threads end up incrementing the counter, then go to sleep,
+    /// the counter could silently wrap around and the final thread would not notice the overflow.
+    /// However, for a 30-bit counter,
+    /// it would take over 100 million threads to reach this threshold.
+    /// This is safe enough we don't have to worry about it.
+    const OVERFLOW_THRESHOLD: SharedCount = SharedCount::new(SharedCount::MAX.value() / 2);
     #[inline]
     fn to_raw(self) -> u32 {
         const {
