@@ -828,9 +828,10 @@ impl<T: ?Sized + SupportedPointee + Hash> Hash for Brc<T> {
 impl<T: ?Sized + SupportedPointee + Eq> Eq for Brc<T> {}
 impl<T: ?Sized + SupportedPointee> Unpin for Brc<T> {}
 // SAFETY: We are thread safe if T is
-unsafe impl<T: ?Sized + SupportedPointee + Sync> Sync for Brc<T> {}
+// We need to require T: Send to safely drop from other threads
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Sync for Brc<T> {}
 // SAFETY: We are thread safe if T is
-unsafe impl<T: ?Sized + SupportedPointee + Sync> Send for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Send for Brc<T> {}
 
 #[cfg(feature = "nightly-coerce")]
 impl<T: ?Sized, U: ?Sized> CoerceUnsized<Brc<U>> for Brc<T>
