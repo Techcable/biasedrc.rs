@@ -37,15 +37,45 @@ pub struct RawBrcHeader {
     marker: PhantomPinned,
 }
 impl RawBrcHeader {
+    /// Lazily initialize the [`threads::THIS_THREAD_STATE`] thread-local variable,
+    /// returning the [`ShortThreadId`] if any.
+    ///
+    /// Moving this to a separate function avoids a second TLS access in the hot-path [`Self::init`].
+    /// We previously called [`LocalThreadState::with_current`] at the beginning of [`Self::init`]
+    /// to ensure the thread state is fully initialized before we asked for the ID.
+    /// However, this means we needed to access two thread locals:
+    /// - [`threads::THIS_THREAD_STATE`] to get the ID and lazy-init the state
+    /// - [`threads::THIS_THREAD_STATE_FAST`] to check if [`crate::collect`] is needed
+    ///
+    /// What is worse, the first TLS was lazy-initialized,
+    /// so it needed an initialization check every time.
+    /// Instead, we just check [`threads::THIS_THREAD_STATE_FAST`] in the hot-path,
+    /// and call out to this function if the state hasn't been initialized yet.
+    /// This is measurably faster (about 9%) than the old approach.
+    #[cold]
+    #[inline(never)]
+    fn init_tid() -> Option<ShortThreadId> {
+        LocalThreadState::with_current(|state| state.short_id()).ok()
+    }
+
     /// Initialize the header, biasing towards the current thread.
     ///
     /// # Safety
     /// The resulting header must be pinned in-memory before it is ever used.
     #[inline]
     pub unsafe fn init() -> Self {
-        // Cannot use LocalThreadState::existing_short_id,
-        // because the thread state may not exist and we want to initialize it.
-        let this_id = LocalThreadState::with_current(LocalThreadState::short_id).ok();
+        let this_id = match LocalThreadState::existing_short_id() {
+            Ok(short_id) => Some(short_id),
+            Err(LocalThreadAccessError::Dead | LocalThreadAccessError::IdOverflow(_)) => {
+                // in this case, the local state was already initialized,
+                // but we cannot participate in biased reference counting
+                None
+            }
+            Err(LocalThreadAccessError::Uninitialized) => {
+                // Need to actually initialize the thread state
+                Self::init_tid()
+            }
+        };
         match this_id {
             None => RawBrcHeader {
                 shared_word: AtomicU32::new(
