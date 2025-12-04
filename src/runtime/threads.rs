@@ -292,23 +292,24 @@ impl LocalThreadState {
     /// This is a separate function to indicate that it is a cold path and to favor outlining.
     #[cold]
     #[inline(never)]
-    #[nounwind::nounwind]
     pub(super) fn collect_slow() {
         // we ignore any access error
         let _ = Self::with_current(|state| {
-            if std::thread::panicking() {
-                // skip collection if we are panicking (helpful if called by Drop)
-                return;
-            }
-            // This match compiles into a comparison against zero
-            if !matches!(
-                state.shared_info.state_flag.load(Ordering::Relaxed),
-                ThreadStateFlag::Live
-            ) {
-                // we don't really need to worry about lock contention here,
-                // because it should only be write-locked if the thread is dying
-                state.collect_force();
-            }
+            nounwind::abort_unwind(|| {
+                if std::thread::panicking() {
+                    // skip collection if we are panicking (helpful if called by Drop)
+                    return;
+                }
+                // This match compiles into a comparison against zero
+                if !matches!(
+                    state.shared_info.state_flag.load(Ordering::Relaxed),
+                    ThreadStateFlag::Live
+                ) {
+                    // we don't really need to worry about lock contention here,
+                    // because it should only be write-locked if the thread is dying
+                    state.collect_force();
+                }
+            });
         });
     }
 
@@ -317,18 +318,19 @@ impl LocalThreadState {
     /// This requires acquiring a state lock to prevent thread death.
     #[cold]
     #[inline(never)]
-    #[nounwind::nounwind]
     pub fn collect_force(&self) {
-        let lock = self.shared_info.shared_state.read();
-        match *lock {
-            SharedThreadState::Live { ref queued_objects } => {
-                // SAFETY: We are the biased thread, so can safely adjust the RCs
-                unsafe { self.shared_info.do_empty_queue(queued_objects) };
+        nounwind::abort_unwind(|| {
+            let lock = self.shared_info.shared_state.read();
+            match *lock {
+                SharedThreadState::Live { ref queued_objects } => {
+                    // SAFETY: We are the biased thread, so can safely adjust the RCs
+                    unsafe { self.shared_info.do_empty_queue(queued_objects) };
+                }
+                SharedThreadState::Dead => {
+                    // nothing more to do
+                }
             }
-            SharedThreadState::Dead => {
-                // nothing more to do
-            }
-        }
+        });
     }
 }
 impl Drop for LocalThreadState {

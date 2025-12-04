@@ -202,12 +202,11 @@ impl RawBrcHeader {
     }
 
     #[cold]
-    #[nounwind::nounwind]
     fn slow_increment(&self) {
         // safe to use a relaxed CAS here, as justified in Arc::clone
         let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
         if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {
-            panic!("Refcount overflow");
+            nounwind::abort_unwind(|| panic!("Refcount overflow"));
         }
     }
 

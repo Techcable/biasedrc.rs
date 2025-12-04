@@ -16,7 +16,7 @@ parking_lot = "0.12"
 thiserror = "2"
 crossbeam-queue = "0.3"
 arbitrary-int = "2"
-nounwind = "0.1"
+nounwind = { version = "0.1", features = ["std"], default-features = false }
 stable_deref_trait = "1.2"
 # Emulate the ptr_metadata unstable feature on stable rust
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
