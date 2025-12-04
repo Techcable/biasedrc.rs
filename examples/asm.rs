@@ -10,6 +10,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[unsafe(no_mangle)]
+pub fn brc_new(x: u32) -> Brc<u32> {
+    Brc::new(x)
+}
+
+#[unsafe(no_mangle)]
+pub fn arc_new(x: u32) -> Arc<u32> {
+    Arc::new(x)
+}
+
+#[unsafe(no_mangle)]
+pub fn rc_new(x: u32) -> Arc<u32> {
+    Arc::new(x)
+}
+
+#[unsafe(no_mangle)]
 pub fn brc_collect() {
     biasedrc::collect();
 }
