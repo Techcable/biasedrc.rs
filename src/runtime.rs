@@ -463,6 +463,11 @@ struct BiasedWord {
     biased_count: BiasedCount,
 }
 impl BiasedWord {
+    /// The number of bits this value takes when packed with [`SelF::to_raw`].
+    ///
+    /// This is not necessarily equal to `size_of::<Self>() * 8`,
+    /// because that is the unpacked size,
+    const BITS: usize = 32;
     const UNOWNED: BiasedWord = BiasedWord {
         owner_id: None,
         biased_count: BiasedCount::ZERO,
@@ -470,7 +475,7 @@ impl BiasedWord {
     #[inline]
     fn to_raw(self) -> u32 {
         const {
-            assert!(ShortThreadId::BITS as usize + BiasedCount::BITS == size_of::<Self>() * 8);
+            assert!(ShortThreadId::BITS as usize + BiasedCount::BITS == Self::BITS);
         }
         ((self.biased_count.value()) << ShortThreadId::BITS)
             | (self
@@ -499,6 +504,11 @@ struct SharedWord {
     queued: bool,
 }
 impl SharedWord {
+    /// The number of bits this value takes when packed with [`SelF::to_raw`].
+    ///
+    /// This is not necessarily equal to `size_of::<Self>() * 8`,
+    /// because that is the unpacked size,
+    const BITS: usize = 32;
     const MERGED_BIT: u32 = 1 << SharedCount::BITS;
     const QUEUED_BIT: u32 = 1 << (SharedCount::BITS + 1);
     /// The threshold past which a reference count should be considered to have overflown.
@@ -516,7 +526,7 @@ impl SharedWord {
     #[inline]
     fn to_raw(self) -> u32 {
         const {
-            assert!(SharedCount::BITS + 2 == size_of::<SharedCount>() * 8);
+            assert!(SharedCount::BITS + 2 == Self::BITS);
         }
         self.shared_count.to_bits()
             | ((self.merged as u32) << SharedCount::BITS)
