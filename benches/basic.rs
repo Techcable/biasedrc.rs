@@ -2,6 +2,7 @@
 use biasedrc::Brc;
 use std::rc::Rc;
 use std::sync::Arc;
+use triomphe::Arc as ArcT;
 
 macro_rules! bench_clones {
     ($c:ident => $($target:ident),*) => {
@@ -35,6 +36,6 @@ macro_rules! bench_drops {
 pub fn main() {
     let mut c = criterion::Criterion::default().configure_from_args();
 
-    bench_clones!(c => Arc, Brc, Rc);
-    bench_drops!(c => Arc, Brc, Rc);
+    bench_clones!(c => Arc, ArcT, Brc, Rc);
+    bench_drops!(c => Arc, ArcT, Brc, Rc);
 }
