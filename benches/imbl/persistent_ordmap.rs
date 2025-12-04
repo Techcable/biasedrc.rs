@@ -6,15 +6,16 @@
     missing_docs
 )]
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
-use imbl::ordmap::OrdMap;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::iter::FromIterator;
 use std::sync::Arc;
 
-use archery::ArcTK;
-use rpds::RedBlackTreeMapSync;
+use archery::{ArcK, RcK};
+use biasedrc::BrcK;
+use imbl::GenericOrdMap;
+use rpds::RedBlackTreeMap;
 
 mod utils;
 use utils::*;
@@ -53,159 +54,179 @@ where
     fn without_max(&self) -> (Option<(K, V)>, Self);
 }
 
-// Implementation for OrdMap
-impl<K, V> BenchMap<K, V> for OrdMap<K, V>
-where
-    K: Clone + Ord,
-    V: Clone,
-{
-    type Iter<'a>
-        = imbl::ordmap::Iter<'a, K, V, imbl::shared_ptr::DefaultSharedPtr>
-    where
-        K: 'a,
-        V: 'a;
-    type RangeIter<'a>
-        = imbl::ordmap::RangedIter<'a, K, V, imbl::shared_ptr::DefaultSharedPtr>
-    where
-        K: 'a,
-        V: 'a;
+macro_rules! imbl_map {
+    ($ptr_kind:ident) => {
+        // Implementation for OrdMap
+        impl<K, V> BenchMap<K, V> for imbl::GenericOrdMap<K, V, $ptr_kind>
+        where
+            K: Clone + Ord,
+            V: Clone,
+        {
+            type Iter<'a>
+                = imbl::ordmap::Iter<'a, K, V, $ptr_kind>
+            where
+                K: 'a,
+                V: 'a;
+            type RangeIter<'a>
+                = imbl::ordmap::RangedIter<'a, K, V, $ptr_kind>
+            where
+                K: 'a,
+                V: 'a;
 
-    fn new() -> Self {
-        OrdMap::new()
-    }
-
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
-        self.insert(k, v)
-    }
-
-    fn insert_clone(&self, k: K, v: V) -> Self {
-        self.update(k, v)
-    }
-
-    fn remove(&mut self, k: &K) -> Option<V> {
-        self.remove(k)
-    }
-
-    fn remove_clone(&self, k: &K) -> Self {
-        self.without(k)
-    }
-
-    fn get<Q>(&self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.get(k)
-    }
-
-    fn iter(&self) -> Self::Iter<'_> {
-        self.iter()
-    }
-
-    fn range<'a>(&'a self, range: std::ops::RangeFrom<&'a K>) -> Self::RangeIter<'a> {
-        self.range(range)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn without_min(&self) -> (Option<(K, V)>, Self) {
-        self.without_min_with_key()
-    }
-
-    fn without_max(&self) -> (Option<(K, V)>, Self) {
-        self.without_max_with_key()
-    }
-}
-
-// Implementation for RedBlackTreeMapSync
-impl<K, V> BenchMap<K, V> for RedBlackTreeMapSync<K, V>
-where
-    K: Clone + Ord,
-    V: Clone,
-{
-    type Iter<'a>
-        = rpds::map::red_black_tree_map::Iter<'a, K, V, ArcTK>
-    where
-        K: 'a,
-        V: 'a;
-    type RangeIter<'a>
-        = std::iter::Map<
-        rpds::map::red_black_tree_map::RangeIter<'a, K, V, std::ops::RangeFrom<&'a K>, K, ArcTK>,
-        fn((&'a K, &'a V)) -> (&'a K, &'a V),
-    >
-    where
-        K: 'a,
-        V: 'a;
-
-    fn new() -> Self {
-        RedBlackTreeMapSync::new_sync()
-    }
-
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
-        self.insert_mut(k, v);
-        None
-    }
-
-    fn insert_clone(&self, k: K, v: V) -> Self {
-        self.insert(k, v)
-    }
-
-    fn remove(&mut self, k: &K) -> Option<V> {
-        if self.remove_mut(k) {
-            None // rpds doesn't return the removed value
-        } else {
-            None
-        }
-    }
-
-    fn remove_clone(&self, k: &K) -> Self {
-        self.remove(k)
-    }
-
-    fn get<Q>(&self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.get(k)
-    }
-
-    fn iter(&self) -> Self::Iter<'_> {
-        self.iter()
-    }
-
-    fn range<'a>(&'a self, range: std::ops::RangeFrom<&'a K>) -> Self::RangeIter<'a> {
-        self.range::<K, _>(range).map(|(k, v)| (k, v))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.size() == 0
-    }
-
-    fn without_min(&self) -> (Option<(K, V)>, Self) {
-        match self.first() {
-            Some((k, _)) => {
-                let k = k.clone();
-                let new_map = self.remove(&k);
-                (self.get(&k).map(|v| (k, v.clone())), new_map)
+            fn new() -> Self {
+                Default::default()
             }
-            None => (None, self.clone()),
-        }
-    }
 
-    fn without_max(&self) -> (Option<(K, V)>, Self) {
-        match self.last() {
-            Some((k, _)) => {
-                let k = k.clone();
-                let new_map = self.remove(&k);
-                (self.get(&k).map(|v| (k, v.clone())), new_map)
+            fn insert(&mut self, k: K, v: V) -> Option<V> {
+                self.insert(k, v)
             }
-            None => (None, self.clone()),
+
+            fn insert_clone(&self, k: K, v: V) -> Self {
+                self.update(k, v)
+            }
+
+            fn remove(&mut self, k: &K) -> Option<V> {
+                self.remove(k)
+            }
+
+            fn remove_clone(&self, k: &K) -> Self {
+                self.without(k)
+            }
+
+            fn get<Q>(&self, k: &Q) -> Option<&V>
+            where
+                K: Borrow<Q>,
+                Q: Ord + ?Sized,
+            {
+                self.get(k)
+            }
+
+            fn iter(&self) -> Self::Iter<'_> {
+                self.iter()
+            }
+
+            fn range<'a>(&'a self, range: std::ops::RangeFrom<&'a K>) -> Self::RangeIter<'a> {
+                self.range(range)
+            }
+
+            fn is_empty(&self) -> bool {
+                self.is_empty()
+            }
+
+            fn without_min(&self) -> (Option<(K, V)>, Self) {
+                self.without_min_with_key()
+            }
+
+            fn without_max(&self) -> (Option<(K, V)>, Self) {
+                self.without_max_with_key()
+            }
         }
-    }
+    };
 }
+imbl_map!(ArcK);
+imbl_map!(BrcK);
+imbl_map!(RcK);
+
+macro_rules! rpds_map {
+    ($ptr_kind:ident) => {
+        impl<K, V> BenchMap<K, V> for rpds::RedBlackTreeMap<K, V, $ptr_kind>
+        where
+            K: Clone + Ord,
+            V: Clone,
+        {
+            type Iter<'a>
+                = rpds::map::red_black_tree_map::Iter<'a, K, V, $ptr_kind>
+            where
+                K: 'a,
+                V: 'a;
+            type RangeIter<'a>
+                = std::iter::Map<
+                rpds::map::red_black_tree_map::RangeIter<
+                    'a,
+                    K,
+                    V,
+                    std::ops::RangeFrom<&'a K>,
+                    K,
+                    $ptr_kind,
+                >,
+                fn((&'a K, &'a V)) -> (&'a K, &'a V),
+            >
+            where
+                K: 'a,
+                V: 'a;
+
+            fn new() -> Self {
+                Default::default()
+            }
+
+            fn insert(&mut self, k: K, v: V) -> Option<V> {
+                self.insert_mut(k, v);
+                None
+            }
+
+            fn insert_clone(&self, k: K, v: V) -> Self {
+                self.insert(k, v)
+            }
+
+            fn remove(&mut self, k: &K) -> Option<V> {
+                if self.remove_mut(k) {
+                    None // rpds doesn't return the removed value
+                } else {
+                    None
+                }
+            }
+
+            fn remove_clone(&self, k: &K) -> Self {
+                self.remove(k)
+            }
+
+            fn get<Q>(&self, k: &Q) -> Option<&V>
+            where
+                K: Borrow<Q>,
+                Q: Ord + ?Sized,
+            {
+                self.get(k)
+            }
+
+            fn iter(&self) -> Self::Iter<'_> {
+                self.iter()
+            }
+
+            fn range<'a>(&'a self, range: std::ops::RangeFrom<&'a K>) -> Self::RangeIter<'a> {
+                self.range::<K, _>(range).map(|(k, v)| (k, v))
+            }
+
+            fn is_empty(&self) -> bool {
+                self.size() == 0
+            }
+
+            fn without_min(&self) -> (Option<(K, V)>, Self) {
+                match self.first() {
+                    Some((k, _)) => {
+                        let k = k.clone();
+                        let new_map = self.remove(&k);
+                        (self.get(&k).map(|v| (k, v.clone())), new_map)
+                    }
+                    None => (None, self.clone()),
+                }
+            }
+
+            fn without_max(&self) -> (Option<(K, V)>, Self) {
+                match self.last() {
+                    Some((k, _)) => {
+                        let k = k.clone();
+                        let new_map = self.remove(&k);
+                        (self.get(&k).map(|v| (k, v.clone())), new_map)
+                    }
+                    None => (None, self.clone()),
+                }
+            }
+        }
+    };
+}
+rpds_map!(ArcK);
+rpds_map!(BrcK);
+rpds_map!(RcK);
 
 // Implementation for BTreeMap
 impl<K, V> BenchMap<K, V> for BTreeMap<K, V>
@@ -510,22 +531,39 @@ where
     })
 }
 
+macro_rules! do_bench {
+    ($c:ident, $group:literal, $target:ident<$key:path, $value:path>) => {
+        bench_group::<$target<$key, $value, ArcK>, $key, $value>($c, &format!($group, ptr = "arc"));
+        bench_group::<$target<$key, $value, BrcK>, $key, $value>($c, &format!($group, ptr = "brc"));
+        bench_group::<$target<$key, $value, BrcK>, $key, $value>($c, &format!($group, ptr = "rc"));
+    };
+}
+
 // Benchmark functions for each map type
 fn bench_ordmap(c: &mut Criterion) {
-    bench_group::<OrdMap<i64, i64>, i64, i64>(c, "ordmap_i64");
-    bench_group::<OrdMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(c, "ordmap_str");
+    do_bench!(c, "imbl_ordmap_{ptr}_i64", GenericOrdMap<i64, i64>);
+    do_bench!(
+        c,
+        "imbl_ordmap_{ptr}_str",
+        GenericOrdMap<Arc<String>, Arc<String>>
+    );
 }
 
 fn bench_rpds(c: &mut Criterion) {
-    bench_group::<RedBlackTreeMapSync<i64, i64>, i64, i64>(c, "rpds_i64");
-    bench_group::<RedBlackTreeMapSync<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(
-        c, "rpds_str",
+    do_bench!(c, "rpds_redblacktree_{ptr}_i64", RedBlackTreeMap<i64, i64>);
+    do_bench!(
+        c,
+        "rpds_redblacktree_{ptr}_str",
+        RedBlackTreeMap<Arc<String>, Arc<String>>
     );
 }
 
 fn bench_btreemap(c: &mut Criterion) {
-    bench_group::<BTreeMap<i64, i64>, i64, i64>(c, "btreemap_i64");
-    bench_group::<BTreeMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(c, "btreemap_str");
+    bench_group::<BTreeMap<i64, i64>, i64, i64>(c, "std_btreemap_i64");
+    bench_group::<BTreeMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(
+        c,
+        "std_btreemap_str",
+    );
 }
 
 // Helper function to run all benchmarks for a specific map/key/value type
@@ -610,13 +648,9 @@ where
 fn ordmap_benches(c: &mut Criterion) {
     bench_ordmap(c);
 
-    if std::env::var("BENCH_STD").is_ok() {
-        bench_btreemap(c);
-    }
+    bench_btreemap(c);
 
-    if std::env::var("BENCH_RPDS").is_ok() {
-        bench_rpds(c);
-    }
+    bench_rpds(c);
 }
 
 criterion_group!(benches, ordmap_benches);

@@ -5,16 +5,17 @@
     missing_docs
 )]
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
-use imbl::hashmap::HashMap;
 use std::borrow::Borrow;
 use std::collections::HashMap as StdHashMap;
-use std::hash::Hash;
+use std::hash::{Hash, RandomState};
 use std::hint::black_box;
 use std::iter::FromIterator;
 use std::sync::Arc;
 
-use archery::ArcTK;
-use rpds::HashTrieMapSync;
+use archery::{ArcK, RcK};
+use biasedrc::BrcK;
+use imbl::GenericHashMap;
+use rpds::HashTrieMap;
 
 mod utils;
 use utils::*;
@@ -44,50 +45,57 @@ where
     fn iter(&self) -> Self::Iter<'_>;
 }
 
-// Implementation for imbl::HashMap
-impl<K, V> BenchMap<K, V> for HashMap<K, V>
-where
-    K: Clone + Hash + Eq,
-    V: Clone,
-{
-    type Iter<'a>
-        = imbl::hashmap::Iter<'a, K, V, imbl::shared_ptr::DefaultSharedPtr>
-    where
-        K: 'a,
-        V: 'a;
+macro_rules! impl_imbl {
+    ($ptr_kind:ident) => {
+        // Implementation for imbl::HashMap
+        impl<K, V> BenchMap<K, V> for GenericHashMap<K, V, RandomState, $ptr_kind>
+        where
+            K: Clone + Hash + Eq,
+            V: Clone,
+        {
+            type Iter<'a>
+                = imbl::hashmap::Iter<'a, K, V, $ptr_kind>
+            where
+                K: 'a,
+                V: 'a;
 
-    fn new() -> Self {
-        HashMap::new()
-    }
+            fn new() -> Self {
+                Default::default()
+            }
 
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
-        self.insert(k, v)
-    }
+            fn insert(&mut self, k: K, v: V) -> Option<V> {
+                self.insert(k, v)
+            }
 
-    fn insert_clone(&self, k: K, v: V) -> Self {
-        self.update(k, v)
-    }
+            fn insert_clone(&self, k: K, v: V) -> Self {
+                self.update(k, v)
+            }
 
-    fn remove(&mut self, k: &K) -> Option<V> {
-        self.remove(k)
-    }
+            fn remove(&mut self, k: &K) -> Option<V> {
+                self.remove(k)
+            }
 
-    fn remove_clone(&self, k: &K) -> Self {
-        self.without(k)
-    }
+            fn remove_clone(&self, k: &K) -> Self {
+                self.without(k)
+            }
 
-    fn get<Q>(&self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.get(k)
-    }
+            fn get<Q>(&self, k: &Q) -> Option<&V>
+            where
+                K: Borrow<Q>,
+                Q: Hash + Eq + ?Sized,
+            {
+                self.get(k)
+            }
 
-    fn iter(&self) -> Self::Iter<'_> {
-        self.iter()
-    }
+            fn iter(&self) -> Self::Iter<'_> {
+                self.iter()
+            }
+        }
+    };
 }
+impl_imbl!(ArcK);
+impl_imbl!(BrcK);
+impl_imbl!(RcK);
 
 // Implementation for std::collections::HashMap
 impl<K, V> BenchMap<K, V> for StdHashMap<K, V>
@@ -139,55 +147,62 @@ where
     }
 }
 
-// Implementation for rpds::HashTrieMapSync
-impl<K, V> BenchMap<K, V> for HashTrieMapSync<K, V>
-where
-    K: Clone + Hash + Eq,
-    V: Clone,
-{
-    type Iter<'a>
-        = rpds::map::hash_trie_map::Iter<'a, K, V, ArcTK>
-    where
-        K: 'a,
-        V: 'a;
+macro_rules! impl_rpds {
+    ($ptr_kind:ident) => {
+        // Implementation for rpds::HashTrieMapSync
+        impl<K, V> BenchMap<K, V> for HashTrieMap<K, V, $ptr_kind>
+        where
+            K: Clone + Hash + Eq,
+            V: Clone,
+        {
+            type Iter<'a>
+                = rpds::map::hash_trie_map::Iter<'a, K, V, $ptr_kind>
+            where
+                K: 'a,
+                V: 'a;
 
-    fn new() -> Self {
-        HashTrieMapSync::new_sync()
-    }
+            fn new() -> Self {
+                Default::default()
+            }
 
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
-        self.insert_mut(k, v);
-        None
-    }
+            fn insert(&mut self, k: K, v: V) -> Option<V> {
+                self.insert_mut(k, v);
+                None
+            }
 
-    fn insert_clone(&self, k: K, v: V) -> Self {
-        self.insert(k, v)
-    }
+            fn insert_clone(&self, k: K, v: V) -> Self {
+                self.insert(k, v)
+            }
 
-    fn remove(&mut self, k: &K) -> Option<V> {
-        if self.remove_mut(k) {
-            None // rpds doesn't return the removed value
-        } else {
-            None
+            fn remove(&mut self, k: &K) -> Option<V> {
+                if self.remove_mut(k) {
+                    None // rpds doesn't return the removed value
+                } else {
+                    None
+                }
+            }
+
+            fn remove_clone(&self, k: &K) -> Self {
+                self.remove(k)
+            }
+
+            fn get<Q>(&self, k: &Q) -> Option<&V>
+            where
+                K: Borrow<Q>,
+                Q: Hash + Eq + ?Sized,
+            {
+                self.get(k)
+            }
+
+            fn iter(&self) -> Self::Iter<'_> {
+                self.iter()
+            }
         }
-    }
-
-    fn remove_clone(&self, k: &K) -> Self {
-        self.remove(k)
-    }
-
-    fn get<Q>(&self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.get(k)
-    }
-
-    fn iter(&self) -> Self::Iter<'_> {
-        self.iter()
-    }
+    };
 }
+impl_rpds!(ArcK);
+impl_rpds!(BrcK);
+impl_rpds!(RcK);
 
 // Generic benchmark functions
 fn bench_lookup<M, K, V>(b: &mut Bencher, size: usize)
@@ -347,24 +362,44 @@ where
     })
 }
 
-// Benchmark functions for each map type
-fn bench_hashmap(c: &mut Criterion) {
-    bench_group::<HashMap<i64, i64>, i64, i64>(c, "hashmap_i64");
-    bench_group::<HashMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(c, "hashmap_str");
+macro_rules! do_bench {
+    ($c:ident, $group:literal, $target:ident<$key:path, $value:path $(, $extra:ident)?>) => {
+        bench_group::<$target<$key, $value, $($extra,)* ArcK>, $key, $value>($c, &format!($group, ptr = "arc"));
+        bench_group::<$target<$key, $value, $($extra,)? BrcK>, $key, $value>($c, &format!($group, ptr = "brc"));
+        bench_group::<$target<$key, $value, $($extra,)? BrcK>, $key, $value>($c, &format!($group, ptr = "rc"));
+    };
 }
 
-fn bench_rpds(c: &mut Criterion) {
-    bench_group::<HashTrieMapSync<i64, i64>, i64, i64>(c, "rpds_i64");
-    bench_group::<HashTrieMapSync<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(
-        c, "rpds_str",
+// Benchmark functions for each map type
+fn bench_hashmap(c: &mut Criterion) {
+    do_bench!(c, "imbl_hashmap_{ptr}_i64", GenericHashMap<i64, i64, RandomState>);
+    do_bench!(
+        c,
+        "imbl_hashmap_{ptr}_str",
+        GenericHashMap<Arc<String>, Arc<String>, RandomState>
     );
 }
 
+fn bench_rpds(c: &mut Criterion) {
+    do_bench!(
+        c,
+        "rpds_hashtrie_{ptr}_str",
+        HashTrieMap<Arc<String>, Arc<String>>
+    );
+    do_bench!(
+        c,
+        "rpds_hashtrie_{ptr}_str",
+        HashTrieMap<Arc<String>, Arc<String>>
+    );
+
+    bench_group::<HashTrieMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(c, "rpds_str");
+}
+
 fn bench_stdhashmap(c: &mut Criterion) {
-    bench_group::<StdHashMap<i64, i64>, i64, i64>(c, "stdhashmap_i64");
+    bench_group::<StdHashMap<i64, i64>, i64, i64>(c, "std_hashmap_i64");
     bench_group::<StdHashMap<Arc<String>, Arc<String>>, Arc<String>, Arc<String>>(
         c,
-        "stdhashmap_str",
+        "std_hashmap_str",
     );
 }
 
@@ -436,13 +471,9 @@ where
 fn hashmap_benches(c: &mut Criterion) {
     bench_hashmap(c);
 
-    if std::env::var("BENCH_STD").is_ok() {
-        bench_stdhashmap(c);
-    }
+    bench_stdhashmap(c);
 
-    if std::env::var("BENCH_RPDS").is_ok() {
-        bench_rpds(c);
-    }
+    bench_rpds(c);
 }
 
 criterion_group!(benches, hashmap_benches);

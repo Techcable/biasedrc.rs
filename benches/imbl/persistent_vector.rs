@@ -4,8 +4,10 @@
     clippy::if_same_then_else,
     missing_docs
 )]
+use archery::{ArcK, RcK, SharedPointerKind};
+use biasedrc::BrcK;
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
-use imbl::vector::Vector;
+use imbl::vector::GenericVector;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
 use std::hint::black_box;
@@ -13,11 +15,14 @@ use std::iter::FromIterator;
 
 mod utils;
 
-// Trait to abstract over different vector-like implementations
+/// Trait to abstract over different vector-like implementations.
+///
+/// This cannot support [`rpds::Vector`] due to lack of two-sided push/pop.
 trait BenchVector<T>: Clone + FromIterator<T>
 where
     T: Clone,
 {
+    type PtrKind: SharedPointerKind;
     type Iter<'a>: Iterator<Item = &'a T>
     where
         Self: 'a,
@@ -42,104 +47,113 @@ where
     fn supports_focus() -> bool {
         false
     }
-    fn focus(&self) -> Option<VectorFocus<'_, T>> {
+    fn focus(&self) -> Option<VectorFocus<'_, T, Self::PtrKind>> {
         None
     }
-    fn focus_mut(&mut self) -> Option<VectorFocusMut<'_, T>> {
+    fn focus_mut(&mut self) -> Option<VectorFocusMut<'_, T, Self::PtrKind>> {
         None
     }
 }
 
 // Wrapper types for Vector's focus feature
-struct VectorFocus<'a, T> {
-    focus: imbl::vector::Focus<'a, T, imbl::shared_ptr::DefaultSharedPtr>,
+struct VectorFocus<'a, T, P: SharedPointerKind> {
+    focus: imbl::vector::Focus<'a, T, P>,
 }
 
-impl<'a, T> VectorFocus<'a, T> {
+impl<'a, T, P: SharedPointerKind> VectorFocus<'a, T, P> {
     fn get(&mut self, index: usize) -> Option<&T> {
         self.focus.get(index)
     }
 }
 
-struct VectorFocusMut<'a, T> {
-    focus: imbl::vector::FocusMut<'a, T, imbl::shared_ptr::DefaultSharedPtr>,
+struct VectorFocusMut<'a, T, P: SharedPointerKind> {
+    focus: imbl::vector::FocusMut<'a, T, P>,
 }
 
-impl<'a, T: Clone> VectorFocusMut<'a, T> {
+impl<'a, T: Clone, P: SharedPointerKind> VectorFocusMut<'a, T, P> {
     fn get(&mut self, index: usize) -> Option<&T> {
         self.focus.get(index)
     }
 }
 
 // Implementation for imbl::Vector
-impl<T: Clone> BenchVector<T> for Vector<T> {
-    type Iter<'a>
-        = imbl::vector::Iter<'a, T, imbl::shared_ptr::DefaultSharedPtr>
-    where
-        T: 'a;
+macro_rules! impl_imbl {
+    ($ptr_kind:ident) => {
+        impl<T: Clone> BenchVector<T> for GenericVector<T, $ptr_kind> {
+            type PtrKind = $ptr_kind;
+            type Iter<'a>
+                = imbl::vector::Iter<'a, T, $ptr_kind>
+            where
+                T: 'a;
 
-    fn new() -> Self {
-        Vector::new()
-    }
+            fn new() -> Self {
+                Default::default()
+            }
 
-    fn push_front(&mut self, value: T) {
-        self.push_front(value);
-    }
+            fn push_front(&mut self, value: T) {
+                self.push_front(value);
+            }
 
-    fn push_back(&mut self, value: T) {
-        self.push_back(value);
-    }
+            fn push_back(&mut self, value: T) {
+                self.push_back(value);
+            }
 
-    fn pop_front(&mut self) -> Option<T> {
-        self.pop_front()
-    }
+            fn pop_front(&mut self) -> Option<T> {
+                self.pop_front()
+            }
 
-    fn pop_back(&mut self) -> Option<T> {
-        self.pop_back()
-    }
+            fn pop_back(&mut self) -> Option<T> {
+                self.pop_back()
+            }
 
-    fn get(&self, index: usize) -> Option<&T> {
-        self.get(index)
-    }
+            fn get(&self, index: usize) -> Option<&T> {
+                self.get(index)
+            }
 
-    fn iter(&self) -> Self::Iter<'_> {
-        self.iter()
-    }
+            fn iter(&self) -> Self::Iter<'_> {
+                self.iter()
+            }
 
-    fn split_off(&mut self, at: usize) -> Self {
-        self.split_off(at)
-    }
+            fn split_off(&mut self, at: usize) -> Self {
+                self.split_off(at)
+            }
 
-    fn append(&mut self, other: Self) {
-        self.append(other);
-    }
+            fn append(&mut self, other: Self) {
+                self.append(other);
+            }
 
-    fn sort(&mut self)
-    where
-        T: Ord,
-    {
-        self.sort();
-    }
+            fn sort(&mut self)
+            where
+                T: Ord,
+            {
+                self.sort();
+            }
 
-    fn supports_focus() -> bool {
-        true
-    }
+            fn supports_focus() -> bool {
+                true
+            }
 
-    fn focus(&self) -> Option<VectorFocus<'_, T>> {
-        Some(VectorFocus {
-            focus: self.focus(),
-        })
-    }
+            fn focus(&self) -> Option<VectorFocus<'_, T, $ptr_kind>> {
+                Some(VectorFocus {
+                    focus: self.focus(),
+                })
+            }
 
-    fn focus_mut(&mut self) -> Option<VectorFocusMut<'_, T>> {
-        Some(VectorFocusMut {
-            focus: self.focus_mut(),
-        })
-    }
+            fn focus_mut(&mut self) -> Option<VectorFocusMut<'_, T, $ptr_kind>> {
+                Some(VectorFocusMut {
+                    focus: self.focus_mut(),
+                })
+            }
+        }
+    };
 }
+impl_imbl!(ArcK);
+impl_imbl!(BrcK);
+impl_imbl!(RcK);
 
 // Implementation for std::collections::VecDeque
 impl<T: Clone> BenchVector<T> for VecDeque<T> {
+    type PtrKind = RcK; // dummy
     type Iter<'a>
         = std::collections::vec_deque::Iter<'a, T>
     where
@@ -405,15 +419,33 @@ fn bench_ops_group<V: BenchVector<usize>>(c: &mut Criterion, group_name: &str) {
     group.finish();
 }
 
+macro_rules! do_bench {
+    ($c:ident, $group:literal, $func:ident, $target:ident<$value:path>) => {
+        $func::<$target<$value, ArcK>>($c, &format!($group, ptr = "arc"));
+        $func::<$target<$value, BrcK>>($c, &format!($group, ptr = "brc"));
+        $func::<$target<$value, BrcK>>($c, &format!($group, ptr = "rc"));
+    };
+}
+
 // Benchmark functions for each vector type
 fn bench_vector(c: &mut Criterion) {
-    bench_sort_group::<Vector<usize>>(c, "vector");
-    bench_ops_group::<Vector<usize>>(c, "vector");
+    do_bench!(
+        c,
+        "imbl_vector_{ptr}",
+        bench_sort_group,
+        GenericVector<usize>
+    );
+    do_bench!(
+        c,
+        "imbl_vector_{ptr}",
+        bench_ops_group,
+        GenericVector<usize>
+    );
 }
 
 fn bench_vecdeque(c: &mut Criterion) {
-    bench_sort_group::<VecDeque<usize>>(c, "vecdeque");
-    bench_ops_group::<VecDeque<usize>>(c, "vecdeque");
+    bench_sort_group::<VecDeque<usize>>(c, "std_vecdeque");
+    bench_ops_group::<VecDeque<usize>>(c, "std_avecdeque");
 }
 
 // Main benchmark entry point
