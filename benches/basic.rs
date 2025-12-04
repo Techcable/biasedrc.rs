@@ -4,6 +4,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use triomphe::Arc as ArcT;
 
+macro_rules! bench_new {
+    ($c:ident => $($target:ident),*) => {
+        $($c.bench_function(concat!(stringify!($target), "::new"), |b| {
+            b.iter_with_large_drop(|| $target::new(7));
+        });)*
+    };
+}
+
 macro_rules! bench_clones {
     ($c:ident => $($target:ident),*) => {
         $($c.bench_function(concat!(stringify!($target), "::clone"), |b| {
@@ -36,6 +44,7 @@ macro_rules! bench_drops {
 pub fn main() {
     let mut c = criterion::Criterion::default().configure_from_args();
 
+    bench_new!(c => Arc, ArcT, Brc, Rc);
     bench_clones!(c => Arc, ArcT, Brc, Rc);
     bench_drops!(c => Arc, ArcT, Brc, Rc);
 }
