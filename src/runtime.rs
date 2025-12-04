@@ -50,7 +50,7 @@ impl RawBrcHeader {
             None => RawBrcHeader {
                 shared_word: AtomicU32::new(
                     SharedWord {
-                        shared_count: i30::new(1),
+                        shared_count: SharedCount::new(1),
                         // mark as merged
                         merged: true,
                         queued: false,
@@ -63,7 +63,7 @@ impl RawBrcHeader {
             Some(this_id) => RawBrcHeader {
                 biased_word: AtomicU32::new(
                     BiasedWord {
-                        biased_count: u20::new(1),
+                        biased_count: BiasedCount::new(1),
                         owner_id: Some(this_id),
                     }
                     .to_raw(),
@@ -72,7 +72,7 @@ impl RawBrcHeader {
                     SharedWord {
                         queued: false,
                         merged: false,
-                        shared_count: i30::new(0),
+                        shared_count: SharedCount::new(0),
                     }
                     .to_raw(),
                 ),
@@ -153,7 +153,7 @@ impl RawBrcHeader {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         let incremented_counter = biased_word
             .biased_count
-            .checked_add(u20::new(1))
+            .checked_add(BiasedCount::new(1))
             .ok_or(FastIncrementFailure)?;
         let this_id = LocalThreadState::existing_short_id().map_err(|_| FastIncrementFailure)?;
         if biased_word.owner_id == Some(this_id) {
@@ -181,7 +181,7 @@ impl RawBrcHeader {
                     let old = SharedWord::from_raw(old);
                     let new_count = old
                         .shared_count
-                        .checked_add(i30::new(1))
+                        .checked_add(SharedCount::new(1))
                         .expect("refcnt overflow");
                     Some(
                         SharedWord {
@@ -242,8 +242,9 @@ impl RawBrcHeader {
         if this_id == owner_id {
             debug_assert_ne!(biased_word.biased_count.value(), 0);
             // SAFETY: Caller guarantees that refcnt > 0
-            let new_biased_count =
-                unsafe { u20::new_unchecked(biased_word.biased_count.value().unchecked_sub(1)) };
+            let new_biased_count = unsafe {
+                BiasedCount::new_unchecked(biased_word.biased_count.value().unchecked_sub(1))
+            };
             // can just update the reference count
             if new_biased_count.value() > 0 {
                 // store updated reference count
@@ -322,7 +323,7 @@ impl RawBrcHeader {
             new = SharedWord {
                 shared_count: old
                     .shared_count
-                    .checked_sub(i30::new(1))
+                    .checked_sub(SharedCount::new(1))
                     .expect("refcnt underflow"),
                 ..old
             };
@@ -469,18 +470,23 @@ impl ErasedDropInfo {
 #[repr(transparent)]
 pub struct ErasedDestructorContext(pub *mut c_void);
 
+type BiasedCount = u20;
+
 #[derive(Copy, Clone, Debug)]
 struct BiasedWord {
     owner_id: Option<ShortThreadId>,
-    biased_count: u20,
+    biased_count: BiasedCount,
 }
 impl BiasedWord {
     const UNOWNED: BiasedWord = BiasedWord {
         owner_id: None,
-        biased_count: u20::ZERO,
+        biased_count: BiasedCount::ZERO,
     };
     #[inline]
     fn to_raw(self) -> u32 {
+        const {
+            assert!(ShortThreadId::BITS as usize + BiasedCount::BITS == size_of::<Self>() * 8);
+        }
         ((self.biased_count.value()) << ShortThreadId::BITS)
             | (self
                 .owner_id
@@ -490,14 +496,16 @@ impl BiasedWord {
     fn from_raw(raw: u32) -> Self {
         BiasedWord {
             owner_id: ShortThreadId::new(arbitrary_int::u12::masked_new(raw)),
-            biased_count: arbitrary_int::u20::masked_new(raw >> ShortThreadId::BITS),
+            biased_count: BiasedCount::masked_new(raw >> ShortThreadId::BITS),
         }
     }
 }
 
+type SharedCount = i30;
+
 #[derive(Copy, Clone, Debug)]
 struct SharedWord {
-    shared_count: i30,
+    shared_count: SharedCount,
     /// This is set by the owner thread when it has merged the shared and biased counters.
     ///
     /// Once this is set, the reference count will never be biased again.
@@ -506,16 +514,21 @@ struct SharedWord {
     queued: bool,
 }
 impl SharedWord {
-    const MERGED_BIT: u32 = 1 << 30;
-    const QUEUED_BIT: u32 = 1 << 31;
+    const MERGED_BIT: u32 = 1 << SharedCount::BITS;
+    const QUEUED_BIT: u32 = 1 << (SharedCount::BITS + 1);
     #[inline]
     fn to_raw(self) -> u32 {
-        self.shared_count.to_bits() | ((self.merged as u32) << 30) | ((self.queued as u32) << 31)
+        const {
+            assert!(SharedCount::BITS + 2 == size_of::<SharedCount>() * 8);
+        }
+        self.shared_count.to_bits()
+            | ((self.merged as u32) << SharedCount::BITS)
+            | ((self.queued as u32) << (SharedCount::BITS + 1))
     }
     #[inline]
     fn from_raw(raw: u32) -> Self {
         SharedWord {
-            shared_count: i30::masked_new(raw),
+            shared_count: SharedCount::masked_new(raw),
             merged: (raw & Self::MERGED_BIT) != 0,
             queued: (raw & Self::QUEUED_BIT) != 0,
         }
@@ -544,9 +557,20 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     let mut new_word: SharedWord;
     loop {
         assert!(!old_word.merged);
-        #[expect(clippy::cast_possible_wrap, reason = "an u14 fits in an i16")]
-        // SAFETY: We know a u20 fits in a i32
-        let biased_count = unsafe { i30::new_unchecked(biased.biased_count.value() as i32) };
+        let biased_count: SharedCount;
+        {
+            const {
+                assert!(
+                    BiasedCount::MAX.value() as i64 <= SharedCount::MAX.value() as i64,
+                    "BiasedCount doesn't fit in a SharedCount"
+                );
+            }
+            #[expect(clippy::cast_possible_wrap, reason = "checked above")]
+            // SAFETY: We just checked above that a BiasedCount fits in a SharedCount
+            unsafe {
+                biased_count = SharedCount::new_unchecked(biased.biased_count.value() as i32);
+            }
+        }
         new_word = SharedWord {
             shared_count: old_word
                 .shared_count
@@ -578,7 +602,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
         header.biased_word.store(
             BiasedWord {
                 owner_id: None,
-                biased_count: u20::ZERO,
+                biased_count: BiasedCount::ZERO,
             }
             .to_raw(),
             Ordering::Relaxed,
