@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rpds::HashTrieMapSync;
 use std::hint::black_box;
@@ -120,7 +121,7 @@ fn rpds_hash_trie_map_sync_iterate(c: &mut Criterion) {
 
 #[allow(unused_variables)]
 fn rpds_hash_trie_map_sync_iterate_parallel(c: &mut Criterion) {
-    #[cfg(feature = "rayon")]
+    #[cfg(false)] // #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
 

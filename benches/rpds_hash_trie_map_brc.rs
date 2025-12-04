@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use biasedrc::BrcK;
 use criterion::{Criterion, criterion_group, criterion_main};
 use rpds::HashTrieMap;
@@ -123,7 +124,7 @@ fn rpds_hash_trie_map_brc_iterate(c: &mut Criterion) {
 
 #[allow(unused_variables)]
 fn rpds_hash_trie_map_brc_iterate_parallel(c: &mut Criterion) {
-    #[cfg(feature = "rayon")]
+    #[cfg(false)] // #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
 
