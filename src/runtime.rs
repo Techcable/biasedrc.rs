@@ -55,7 +55,7 @@ impl RawBrcHeader {
     #[cold]
     #[inline(never)]
     fn init_tid() -> Option<ShortThreadId> {
-        LocalThreadState::with_current(|state| state.short_id()).ok()
+        LocalThreadState::with_current(LocalThreadState::short_id).ok()
     }
 
     /// Initialize the header, biasing towards the current thread.
@@ -135,21 +135,50 @@ impl RawBrcHeader {
         let shared_word = SharedWord::from_raw(self.shared_word.load(Ordering::Acquire));
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         if shared_word.merged {
-            debug_assert!(shared_word.shared_count.value() > 0, "{shared_word:?}");
             let res = shared_word.shared_count.value();
-            debug_assert!(res >= 0, "bad merged refcount {res:?}");
+            if res < 0 {
+                // SAFETY: This can only happen if there are more decrements than clones
+                // This is undefined behavior on the part of the user
+                unsafe {
+                    if cfg!(debug_assertions) {
+                        undefined_behavior::negative_refcnt_merge();
+                    } else {
+                        core::hint::unreachable_unchecked()
+                    }
+                }
+            }
             #[expect(
                 clippy::cast_sign_loss,
                 reason = "Reference count should be nonnegative for merged threads"
             )]
             Ok(res as usize)
         } else if biased_word.owner_id == this_thread_id {
-            let (sum_count, overflow) = u32::from(biased_word.biased_count)
-                .overflowing_add_signed(shared_word.shared_count.value());
-            debug_assert!(
-                !overflow,
-                "Sum overflows for {shared_word:?} + {biased_word:?}"
-            );
+            const {
+                assert!(
+                    BiasedCount::BITS + 1 < u32::BITS as usize,
+                    "biased count should be at least one bit smaller than u32"
+                );
+                assert!(
+                    SharedCount::BITS + 1 < u32::BITS as usize,
+                    "biased count should be at least one bit smaller than u32"
+                );
+            }
+            let biased_count = u32::from(biased_word.biased_count);
+            let shared_count = shared_word.shared_count.value();
+            // Since biased_count is 20-bits and shared_count is i30,
+            // the result should never overflow a u32.
+            // We just statically verified this above.
+            //
+            // The merged count cannot underflow, for reasons described above
+            let sum_count: u32 = {
+                if cfg!(debug_assertions) {
+                    biased_count
+                        .checked_add_signed(shared_count)
+                        .unwrap_or_else(|| undefined_behavior::strong_count_arith_overflow())
+                } else {
+                    biased_count.wrapping_add_signed(shared_count)
+                }
+            };
             Ok(sum_count as usize)
         } else {
             // We are not the owning thread, and the RCs have not been merged,
@@ -206,7 +235,7 @@ impl RawBrcHeader {
         // safe to use a relaxed CAS here, as justified in Arc::clone
         let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
         if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {
-            nounwind::abort_unwind(|| panic!("Refcount overflow"));
+            fatal_errors::shared_refcnt_overflow();
         }
     }
 
@@ -339,7 +368,7 @@ impl RawBrcHeader {
                 shared_count: old
                     .shared_count
                     .checked_sub(SharedCount::new(1))
-                    .expect("refcnt underflow"),
+                    .unwrap_or_else(|| fatal_errors::shared_refcnt_underflow()),
                 ..old
             };
             if new.shared_count.value() < 0 {
@@ -360,11 +389,12 @@ impl RawBrcHeader {
             let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
             let owner_id = biased_word
                 .owner_id
-                .expect("due to negative refcnt, must have owner");
-            // SAFETY: Queued object is
+                .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
+            // SAFETY: The refcnt guarantees the header will not be dropped,
+            // and the caller guarantees the drop information is valid
             match unsafe {
                 threads::SharedThreadInfo::get_by_id(owner_id)
-                    .unwrap_or_else(|| panic!("thread info for owner {owner_id:?} is undefined"))
+                    .unwrap_or_else(|| undefined_behavior::owner_undefined_state())
                     .queue_object(QueuedObject {
                         header_ptr: NonNull::from(self),
                         drop: drop.clone(),
@@ -588,8 +618,10 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     let header = unsafe { object.header_ptr.as_ref() };
     // we own this so don't need a fence
     let biased = BiasedWord::from_raw(header.biased_word.load(Ordering::Relaxed));
+    if biased.owner_id != Some(biased_tid) {
+        undefined_behavior::explicit_merge_bad_id();
+    }
     // now update the shared word
-    assert_eq!(biased.owner_id, Some(biased_tid));
     let mut old_word = SharedWord::from_raw(header.shared_word.load(Ordering::Relaxed));
     let mut new_word: SharedWord;
     loop {
@@ -612,7 +644,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             shared_count: old_word
                 .shared_count
                 .checked_add(biased_count)
-                .expect("refcnt overflow when merging pointers"),
+                .unwrap_or_else(|| fatal_errors::merged_refcnt_overflow()),
             merged: true,
             ..old_word
         };
@@ -630,20 +662,22 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             }
         }
     }
-    assert!(new_word.shared_count.value() >= 0, "{new_word:?}");
-    if new_word.shared_count.value() == 0 {
-        // SAFETY: Caller promises the drop function is valid
-        unsafe { object.drop.dealloc(object.header_ptr) }
-    } else {
-        // release ownership/unbias
-        header.biased_word.store(
-            BiasedWord {
-                owner_id: None,
-                biased_count: BiasedCount::ZERO,
-            }
-            .to_raw(),
-            Ordering::Relaxed,
-        );
+    match new_word.shared_count.value().cmp(&0) {
+        std::cmp::Ordering::Less => {
+            // This can only happen if there are more drops then clones, which is UB
+            // check for it anyway since we are in the cold-path
+            undefined_behavior::negative_refcnt_merge()
+        }
+        std::cmp::Ordering::Equal => {
+            // SAFETY: Caller promises the drop function is valid
+            unsafe { object.drop.dealloc(object.header_ptr) }
+        }
+        std::cmp::Ordering::Greater => {
+            // release ownership/unbias
+            header
+                .biased_word
+                .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -668,4 +702,48 @@ pub fn collect() {
 #[cold]
 pub fn collect_force() {
     let _ = LocalThreadState::with_current(LocalThreadState::collect_force);
+}
+
+/// Internal errors that should trigger aborts.
+mod fatal_errors {
+    macro_rules! fatal_error {
+        ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {
+            #[cold]
+            #[inline(never)]
+            pub(crate) fn $name() -> ! {
+                nounwind::abort_unwind(|| {
+                    panic!(concat!("biasedrc: ", $fmt) $(, $($arg)*)*);
+                })
+            }
+        };
+    }
+
+    fatal_error!(shared_refcnt_underflow => "Reference count underflow for shared counter");
+    fatal_error!(shared_refcnt_overflow => "Reference count overflow for a shared counter");
+    fatal_error!(merged_refcnt_overflow => "Merged reference counts overflow the shared counter");
+}
+
+/// Encountered a situation that is undefined behavior.
+///
+/// This does not ever call [`core::hint::unreachable_unchecked`],
+/// but instead aborts with a descriptive error message.
+#[cfg_attr(not(debug_assertions), allow(unused))]
+mod undefined_behavior {
+    macro_rules! undefined_behavior {
+        ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {
+            #[cold]
+            #[inline(never)]
+            pub(crate) fn $name() -> ! {
+                nounwind::abort_unwind(|| {
+                    panic!(concat!("biasedrc encountered undefined behavior: ", $fmt) $(, $($arg)*)*);
+                })
+            }
+        };
+    }
+
+    undefined_behavior!(negative_refcnt_merge => "Negative reference count after merging counter");
+    undefined_behavior!(explicit_merge_bad_id => "The `explicit_merge` function is called with bad tid");
+    undefined_behavior!(negative_refcnt_no_owner => "Negative reference count but no biased thread");
+    undefined_behavior!(owner_undefined_state => "Biased thread has undefined state, but still owns objects");
+    undefined_behavior!(strong_count_arith_overflow => "Computing the strong_count either overflowed (impossible) or underflowed (UB) a counter");
 }
