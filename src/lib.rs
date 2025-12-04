@@ -3,13 +3,64 @@
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
+#![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
 
+#[cfg(not(feature = "nightly-allocator"))]
+use allocator_api2::alloc::{Allocator, Global, System};
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
 #[cfg(feature = "nightly-coerce")]
 use core::{marker::Unsize, ops::CoerceUnsized};
 #[cfg(not(feature = "nightly-ptr-meta"))]
 use ptr_meta_stable as ptr_meta;
+#[cfg(feature = "nightly-allocator")]
+use std::alloc::{Allocator, Global, System};
+
+/// An allocator which is known to be a singleton.
+///
+/// # Safety
+/// There must only ever be a single instance of the allocator,
+/// which is always equivalent to the value returned by [`Default::default`].
+///
+/// This means that a user of a singleton allocator can forget the allocator right after allocation,
+/// then use [`Default`] to recreate it when it is needed again.
+/// In particular, the following code must always work regardless of the value of `alloc`
+/// or the code executed between the dropping of the allocator and deallocation:
+/// ```no_run
+/// # use std::alloc::Layout;
+/// # use biasedrc::SingletonAllocator;
+/// fn example<A: SingletonAllocator>(alloc: A) {
+///     let layout = Layout::new::<i32>();
+///     let allocation = alloc.allocate();
+///     drop(alloc);
+///     // <arbitrary user code>
+///     // SAFETY: We know the allocator is a singleton
+///     unsafe { A::default().deallocate(allocation, layout) } ;
+/// }
+/// ```
+///
+/// As a consequence of these requirements, the [`Clone`] and [`Drop`] methods must be trivial.
+/// In other words, the type should be semantically [`Copy`].
+pub unsafe trait SingletonAllocator: Allocator + Clone + Default + 'static {
+    /// Get a static reference to the singleton instance.
+    ///
+    /// Used to implement [`Brc::allocator`].
+    fn instance_ref() -> &'static Self;
+}
+// SAFETY: We know the global allocator is a singleton
+unsafe impl SingletonAllocator for Global {
+    #[inline]
+    fn instance_ref() -> &'static Self {
+        &Global
+    }
+}
+// SAFETY: We know the system allocator is a singleton
+unsafe impl SingletonAllocator for System {
+    #[inline]
+    fn instance_ref() -> &'static Self {
+        &System
+    }
+}
 
 use pointee::{SupportedMetadata, SupportedPointeeInternal};
 use ptr_meta::Pointee;
@@ -65,16 +116,22 @@ impl LayoutInfo {
 /// This means that [`Brc::get_mut`] and [`Brc::try_unwrap`] can fail spuriously
 /// even if the [`Arc`] is logically unique.
 /// It also means that [`Brc::into_inner`] cannot provide the same guarantees as [`Arc::into_inner`].
+///
+/// Because the runtime needs to queue objects that migrate across threads,
+/// the allocator must implement [`SingletonAllocator`].
+/// Aside from this restriction, we try to mirror the allocator API of [`Arc`].
+/// We could potentially relax this requirement by storing the allocator in the header.
 #[repr(transparent)] // can be transmuted into a pointer
-pub struct Brc<T: ?Sized + SupportedPointee> {
+pub struct Brc<T: ?Sized + SupportedPointee, A: SingletonAllocator = Global> {
     ptr: NonNull<T>,
     marker: PhantomData<T>,
+    alloc: PhantomData<&'static A>,
 }
 impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
-        Self::new_with(|| value)
+        Self::new_in(value, Global)
     }
 
     /// Construct a new [`Brc`], using a closure to initialize the specified value.
@@ -84,7 +141,65 @@ impl<T> Brc<T> {
     pub fn new_with(func: impl FnOnce() -> T) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
         // or the initialization function panics
-        unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(func())) }
+        unsafe {
+            Self::alloc_with_in(
+                Layout::new::<T>(),
+                (),
+                |target| target.write(func()),
+                Global,
+            )
+        }
+    }
+}
+impl<T: ?Sized + SupportedPointee> Brc<T> {
+    /// Convert this [`Brc`] into a raw pointer,
+    /// similar to [`std::sync::Arc::into_raw`].
+    ///
+    /// # Safety
+    /// This is perfectly safe, but may leak memory.
+    ///
+    /// # Panics
+    /// This function is infallible.
+    #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
+    #[inline]
+    pub fn into_raw(this: Self) -> *const T {
+        Self::into_raw_with_allocator(this).0
+    }
+
+    /// Create a [`Brc`] from a raw pointer,
+    /// similar to [`std::sync::Arc::from_raw`].
+    ///
+    /// # Safety
+    /// This must correspond exactly to an owned reference count from [`Brc::into_raw`],
+    /// and is vulnerable to double-free if called multiple times on the same pointer.
+    ///
+    /// This is only valid for the result of [`Brc::into_raw`], not for any other piece of memory.
+    ///
+    /// # Panics
+    /// This function is infallible.
+    #[inline]
+    pub unsafe fn from_raw(ptr: *const T) -> Brc<T> {
+        // SAFETY: Guaranteed by the caller
+        unsafe { Self::from_raw_in(ptr, Global) }
+    }
+}
+impl<T, A: SingletonAllocator> Brc<T, A> {
+    /// Construct a new [`Brc`] with the specified value,
+    /// using a specific allocator.
+    #[inline]
+    pub fn new_in(value: T, alloc: A) -> Self {
+        Self::new_with_in(|| value, alloc)
+    }
+
+    /// Construct a new [`Brc`] using a specific allocator,
+    /// and using a closure to initialize the specified value.
+    ///
+    /// This can potentially improve performance by allowing values to be constructed in place.
+    #[inline]
+    pub fn new_with_in(func: impl FnOnce() -> T, alloc: A) -> Self {
+        // SAFETY: Either we fully initialize the newly allocated memory,
+        // or the initialization function panics
+        unsafe { Self::alloc_with_in(Layout::new::<T>(), (), |target| target.write(func()), alloc) }
     }
 
     /// If the [`Brc`] is uniquely owned,
@@ -142,21 +257,23 @@ impl<T> Brc<T> {
         Self::try_unwrap(this).ok()
     }
 }
-impl<T> Brc<[T]> {
-    /// Allocate a slice of memory rom a [`Layout`] and a,
-    /// whose length is trusted to be exact.
+impl<T, A: SingletonAllocator> Brc<[T], A> {
+    /// Allocate a slice of memory with a specific [`Layout`],
+    /// in a particular allocator,
+    /// where the length of the iterator is trusted to be exact.
     ///
     /// The iterator is permitted to panic, both in [`Iterator::next`] and [`Drop`].
     ///
     /// # Safety
     /// The layout must match the result of [`Layout::array`].
-    /// The calculation is moved to the caller to potentially avoid a panic.
+    /// The calculation is moved to the caller to potentially avoid a overflow check.
     ///
     /// The iterator must either panic or yield precisely as many elements as its length.
     #[deny(clippy::multiple_unsafe_ops_per_block)]
-    pub unsafe fn from_iter_exact_trusted(
+    unsafe fn from_iter_exact_trusted_in(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
+        alloc: A,
     ) -> Self {
         let len = iter.len();
         debug_assert_eq!(Ok(layout), Layout::array::<T>(len));
@@ -200,16 +317,28 @@ impl<T> Brc<[T]> {
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
-        unsafe { Brc::alloc_with(layout, len, do_init) }
+        unsafe { Brc::alloc_with_in(layout, len, do_init, alloc) }
     }
 }
-impl<T: ?Sized + SupportedPointee> Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Brc<T, A> {
+    /// Return a reference to the underlying allocator.
+    #[inline]
+    pub fn allocator(this: &Self) -> &A {
+        let _ = this;
+        A::instance_ref()
+    }
+
     /// Initialize the value using the specified callback.
     ///
     /// # Safety
     /// Callback must either fully initialize the memory or panic.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
-    unsafe fn alloc_with(layout: Layout, meta: T::Metadata, func: impl FnOnce(*mut T)) -> Brc<T> {
+    unsafe fn alloc_with_in(
+        layout: Layout,
+        meta: T::Metadata,
+        func: impl FnOnce(*mut T),
+        alloc: A,
+    ) -> Self {
         #[cfg(not(no_implicit_collect))]
         collect();
         #[cold]
@@ -220,61 +349,83 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         let Ok(layout) = LayoutInfo::new(layout) else {
             layout_overflow()
         };
-        struct CleanupGuard {
-            ptr: *mut u8,
+        struct CleanupGuard<'a, A: Allocator> {
+            ptr: NonNull<u8>,
             layout: Layout,
+            alloc: &'a A,
         }
-        impl Drop for CleanupGuard {
+        impl<A: Allocator> Drop for CleanupGuard<'_, A> {
             #[inline]
             fn drop(&mut self) {
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
-                unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+                unsafe { self.alloc.deallocate(self.ptr, self.layout) }
             }
         }
         // SAFETY: Know the layout is non-empty, since it includes the header even if T is a ZST
-        let allocated = unsafe { std::alloc::alloc(layout.full_layout) };
-        if allocated.is_null() {
-            std::alloc::handle_alloc_error(layout.full_layout);
-        }
-        let guard = CleanupGuard {
-            ptr: allocated,
-            layout: layout.full_layout,
+        let Ok(allocated) = alloc.allocate(layout.full_layout) else {
+            std::alloc::handle_alloc_error(layout.full_layout)
         };
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "allocated with appropriate alignment"
-        )]
+        let guard = CleanupGuard {
+            ptr: allocated.cast(),
+            layout: layout.full_layout,
+            alloc: &alloc,
+        };
         // SAFETY: Memory is newly allocated so it is known to be valid
         unsafe {
             allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
         }
         // SAFETY: We trust the LayoutInfo to have the correct offset
         let value_ptr_addr = unsafe { allocated.byte_offset(layout.value_offset).cast::<()>() };
-        let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
-        func(value_ptr);
+        let value_ptr = ptr_meta::from_raw_parts::<T>(value_ptr_addr.as_ptr().cast_const(), meta);
+        func(value_ptr.cast_mut());
         std::mem::forget(guard);
         // SAFETY: Allocated pointer is valid and never null
-        unsafe { Self::from_raw(value_ptr) }
+        unsafe { Self::from_raw_in(value_ptr, alloc) }
     }
-    /// Create a [`Brc`] from a raw pointer,
-    /// similar to [`std::sync::Arc::from_raw`].
+
+    /// Create a [`Brc`] from a raw pointer, using a specific allocator,
+    /// similar to [`std::sync::Arc::from_raw_in`].
     ///
     /// # Safety
     /// This must correspond exactly to an owned reference count from [`Brc::into_raw`],
     /// and is vulnerable to double-free if called multiple times on the same pointer.
     ///
     /// This is only valid for the result of [`Brc::into_raw`], not for any other piece of memory.
+    /// The allocator must match that of the original pointer as well.
     ///
     /// # Panics
     /// This function is infallible.
     #[inline]
-    pub unsafe fn from_raw(ptr: *mut T) -> Brc<T> {
+    pub unsafe fn from_raw_in(ptr: *const T, alloc: A) -> Self {
+        let _ = alloc; // discard because SingletonAllocator
         Brc {
             // SAFETY: Cannot be null as it comes from `into_raw`
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
             marker: PhantomData,
+            alloc: PhantomData,
         }
+    }
+
+    /// Convert this [`Brc`] into a raw pointer,
+    /// along with its backing allocator.
+    ///
+    /// This is similar to [`std::sync::Arc::into_raw_with_allocator`].
+    ///
+    /// # Safety
+    /// This is perfectly safe, but may leak memory.
+    ///
+    /// # Panics
+    /// This function is infallible.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "inherent method could conflict with deref"
+    )]
+    #[inline]
+    pub fn into_raw_with_allocator(this: Self) -> (*const T, A) {
+        let this = ManuallyDrop::new(this);
+        // The SingletonAllocator guarantees A::default() is equivalent to what we started with
+        (this.ptr.as_ptr().cast_const(), A::default())
     }
 
     /// Return the number of strong references to the object,
@@ -357,25 +508,10 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
             unsafe { Self::get_mut_unchecked(this) }
         } else {
             let value = &**this;
-            *this = Self::new_with(|| T::clone(value));
+            *this = Self::new_with_in(|| T::clone(value), A::default());
             // SAFETY: We have ensured the reference is unique
             unsafe { Self::get_mut_unchecked(this) }
         }
-    }
-
-    /// Convert this [`Brc`] into a raw pointer,
-    /// similar to [`std::sync::Arc::into_raw`].
-    ///
-    /// # Safety
-    /// This is perfectly safe, but may leak memory.
-    ///
-    /// # Panics
-    /// This function is infallible.
-    #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
-    #[inline]
-    pub fn into_raw(this: Self) -> *mut T {
-        let value = ManuallyDrop::new(this);
-        value.ptr.as_ptr()
     }
 
     #[inline]
@@ -398,7 +534,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         }
     }
 }
-impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Deref for Brc<T, A> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -406,45 +542,47 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
         unsafe { self.ptr.as_ref() }
     }
 }
-impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Drop for Brc<T, A> {
     #[inline]
     fn drop(&mut self) {
         #[cfg(not(no_implicit_collect))]
         collect();
         let value: &T = self.deref();
-        let context = DropContext::<T> {
+        let context = DropContext::<T, A> {
             metadata: ptr_meta::metadata(value),
             value_offset: self.layout().value_offset,
             marker: PhantomData,
+            alloc: PhantomData,
         };
         // SAFETY: We own a reference count and the context is valid
         unsafe { self.header().decrement_strong(context) }
     }
 }
-impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Clone for Brc<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         #[cfg(not(no_implicit_collect))]
         collect();
         self.header().increment_strong();
         // SAFETY: Just successfully incremented the refcnt
-        unsafe { Brc::from_raw(self.ptr.as_ptr()) }
+        unsafe { Brc::from_raw_in(self.ptr.as_ptr(), A::default()) }
     }
 }
 
-struct DropContext<T: ?Sized + SupportedPointee> {
+struct DropContext<T: ?Sized + SupportedPointee, A: SingletonAllocator> {
     metadata: <T as Pointee>::Metadata,
     value_offset: isize,
     marker: PhantomData<fn(*mut T)>,
+    alloc: PhantomData<&'static A>,
 }
-impl<T: ?Sized + SupportedPointee> Copy for DropContext<T> {}
-impl<T: ?Sized + SupportedPointee> Clone for DropContext<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Copy for DropContext<T, A> {}
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Clone for DropContext<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> DropInfo for DropContext<T, A> {
     #[inline]
     fn value_offset(&self) -> isize {
         self.value_offset
@@ -478,7 +616,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
         let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
         debug_assert_eq!(layout_info.value_offset, value_offset);
         // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { std::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
+        unsafe { A::default().deallocate(header_ptr.cast(), layout_info.full_layout) };
     }
 }
 
@@ -661,7 +799,7 @@ impl Debug for BrcK {
     }
 }
 
-impl<T: ?Sized + SupportedPointee + Error> Error for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Error, A: SingletonAllocator> Error for Brc<T, A> {
     #[inline]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.deref().source()
@@ -680,60 +818,93 @@ impl<T: ?Sized + SupportedPointee + Error> Error for Brc<T> {
     }
 }
 // SAFETY: A Cloned Brc just increments the RC, so memory location is the same
-unsafe impl<T: ?Sized + SupportedPointee> CloneStableDeref for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> CloneStableDeref for Brc<T, A> {}
 // SAFETY: A Brc is heap allocated so the memory never moves
-unsafe impl<T: ?Sized + SupportedPointee> StableDeref for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> StableDeref for Brc<T, A> {}
 impl<T> From<T> for Brc<T> {
     #[inline]
     fn from(value: T) -> Self {
         Brc::new(value)
     }
 }
-/// Convert from a [`Box`] to a [`Brc`].
-///
-/// This conversion is guaranteed not to copy values to the stack,
-/// which means large values cannot trigger stack overflow.
-///
-/// However, this cannot reuse the allocation as a [`Box`] has no room to hold the reference count.
-impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
-    #[inline]
-    fn from(value: Box<T>) -> Self {
-        let meta = ptr_meta::metadata(&raw const *value);
-        let layout = Layout::for_value::<T>(&*value);
-        // SAFETY: Fully initializes the value by copying from the Box.
-        // Can only fail if the allocation does
-        unsafe {
-            Self::alloc_with(layout, meta, move |dest| {
-                let value = ManuallyDrop::new(value);
-                dest.cast::<u8>().copy_from_nonoverlapping(
-                    core::ptr::from_ref::<T>(&**value).cast::<u8>(),
-                    layout.size(),
-                );
-                drop(ManuallyDrop::into_inner(value));
-            })
+macro_rules! do_box_impl {
+    (impl<$value_param:ident $(, $alloc_param:ident)?> From<$src:path> for $dest:path) => {
+        /// Convert from a `Box` to a [`Brc`].
+        ///
+        /// This conversion is guaranteed not to copy values to the stack,
+        /// which means large values cannot trigger stack overflow.
+        ///
+        /// This cannot reuse the allocation from the [`Box`],
+        /// because it has no room to hold the reference count.
+        impl<$value_param: ?Sized + SupportedPointee $(, $alloc_param: SingletonAllocator)*> From<$src> for $dest {
+            #[inline]
+            fn from(value: $src) -> Self {
+                let meta = ptr_meta::metadata(&raw const *value);
+                let layout = Layout::for_value::<$value_param>(&*value);
+                // SAFETY: Fully initializes the value by copying from the Box.
+                // Can only fail if the allocation does
+                unsafe {
+                    Self::alloc_with_in(
+                        layout,
+                        meta,
+                        move |dest| {
+                            let value = ManuallyDrop::new(value);
+                            dest.cast::<u8>().copy_from_nonoverlapping(
+                                core::ptr::from_ref::<T>(&**value).cast::<u8>(),
+                                layout.size(),
+                            );
+                            drop(ManuallyDrop::into_inner(value));
+                        },
+                        Default::default(),
+                    )
+                }
+            }
         }
-    }
+    };
 }
-impl<T: Clone> From<&[T]> for Brc<[T]> {
+#[cfg(feature = "nightly-allocator")]
+do_box_impl!(impl<T, A> From<Box<T, A>> for Brc<T, A>);
+#[cfg(not(feature = "nightly-allocator"))]
+do_box_impl!(impl<T> From<Box<T>> for Brc<T>);
+#[cfg(not(feature = "nightly-allocator"))]
+do_box_impl!(impl<T, A> From<allocator_api2::boxed::Box<T, A>> for Brc<T>);
+impl<T: Clone, A: SingletonAllocator> From<&[T]> for Brc<[T], A> {
     fn from(src: &[T]) -> Self {
         let layout = Layout::for_value(src);
         // SAFETY: We trust the slice iterator + cloned() to have correct length
-        unsafe { Self::from_iter_exact_trusted(layout, src.iter().cloned()) }
+        unsafe { Self::from_iter_exact_trusted_in(layout, src.iter().cloned(), A::default()) }
     }
 }
-impl<T> From<Vec<T>> for Brc<[T]> {
-    fn from(value: Vec<T>) -> Self {
-        let layout = Layout::for_value(value.as_slice());
-        // SAFETY: We trust the Vec iterator to have the correct length
-        unsafe { Self::from_iter_exact_trusted(layout, value.into_iter()) }
-    }
+
+macro_rules! do_box_impl {
+    (impl<$value_param:ident $(, $alloc_param:ident)?> From<$src:path> for $dest:path) => {
+        /// Convert from a `Vec` to a [`Brc`].
+        ///
+        /// This cannot reuse the allocation from the [`Vec`],
+        /// because it has no room to hold the reference count.
+        impl<$value_param $(, $alloc_param: SingletonAllocator)*> From<$src> for $dest {
+            #[inline]
+            fn from(value: $src) -> Self {
+                let layout = Layout::for_value::<[$value_param]>(value.as_slice());
+                // SAFETY: We trust the Vec iterator to have the correct length
+                unsafe { Self::from_iter_exact_trusted_in(layout, value.into_iter(), Default::default()) }
+            }
+        }
+    };
 }
-impl From<&str> for Brc<str> {
+#[cfg(feature = "nightly-allocator")]
+do_box_impl!(impl<T, A> From<Vec<T, A>> for Brc<[T], A>);
+#[cfg(not(feature = "nightly-allocator"))]
+do_box_impl!(impl<T> From<Vec<T>> for Brc<[T]>);
+#[cfg(not(feature = "nightly-allocator"))]
+do_box_impl!(impl<T, A> From<allocator_api2::vec::Vec<T, A>> for Brc<[T], A>);
+
+impl<A: SingletonAllocator> From<&str> for Brc<str, A> {
     #[inline]
     fn from(value: &str) -> Self {
         let bytes = Brc::<[u8]>::from(value.as_bytes());
         // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
-        unsafe { Brc::from_raw(Brc::into_raw(bytes) as *mut str) }
+        unsafe { Brc::from_raw_in(Brc::into_raw(bytes) as *mut str, A::default()) }
     }
 }
 impl<T> FromIterator<T> for Brc<[T]> {
@@ -772,79 +943,94 @@ impl<T> FromIterator<T> for Brc<[T]> {
             let layout = Layout::array::<T>(len).expect("Layout overflow");
             // SAFETY: The AssertExactIter verifies the length is correct
             // The Layout is correct
-            unsafe { Self::from_iter_exact_trusted(layout, AssertExactIter { len, inner: iter }) }
+            unsafe {
+                Self::from_iter_exact_trusted_in(
+                    layout,
+                    AssertExactIter { len, inner: iter },
+                    Global,
+                )
+            }
         } else {
             // need to buffer
             iter.collect::<Vec<T>>().into()
         }
     }
 }
-impl<T: ?Sized + SupportedPointee> Borrow<T> for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Borrow<T> for Brc<T, A> {
     #[inline]
     fn borrow(&self) -> &T {
         self.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee> AsRef<T> for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> AsRef<T> for Brc<T, A> {
     #[inline]
     fn as_ref(&self) -> &T {
         self.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee + Debug> Debug for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Debug, A: SingletonAllocator> Debug for Brc<T, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.deref(), f)
     }
 }
-impl<T: ?Sized + SupportedPointee + Display> Display for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Display, A: SingletonAllocator> Display for Brc<T, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.deref(), f)
     }
 }
-impl<T: ?Sized + SupportedPointee + PartialEq> PartialEq for Brc<T> {
+impl<T: ?Sized + SupportedPointee + PartialEq, A: SingletonAllocator> PartialEq for Brc<T, A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.deref() == other.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee + PartialOrd> PartialOrd for Brc<T> {
+impl<T: ?Sized + SupportedPointee + PartialOrd, A: SingletonAllocator> PartialOrd for Brc<T, A> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.deref().partial_cmp(other.deref())
     }
 }
-impl<T: ?Sized + SupportedPointee + Ord> Ord for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Ord, A: SingletonAllocator> Ord for Brc<T, A> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.deref().cmp(other.deref())
     }
 }
-impl<T: ?Sized + SupportedPointee + Hash> Hash for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Hash, A: SingletonAllocator> Hash for Brc<T, A> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.deref().hash(state);
     }
 }
-impl<T: ?Sized + SupportedPointee + Eq> Eq for Brc<T> {}
-impl<T: ?Sized + SupportedPointee> Unpin for Brc<T> {}
+impl<T: ?Sized + SupportedPointee + Eq, A: SingletonAllocator> Eq for Brc<T, A> {}
+impl<T: ?Sized + SupportedPointee, A: SingletonAllocator> Unpin for Brc<T, A> {}
 // SAFETY: We are thread safe if T is
 // We need to require T: Send to safely drop from other threads
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Sync for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: SingletonAllocator + Sync> Sync
+    for Brc<T, A>
+{
+}
 // SAFETY: We are thread safe if T is
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Send for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: SingletonAllocator + Send> Send
+    for Brc<T, A>
+{
+}
 
 #[cfg(feature = "nightly-coerce")]
-impl<T: ?Sized, U: ?Sized> CoerceUnsized<Brc<U>> for Brc<T>
+impl<T: ?Sized, U: ?Sized, A> CoerceUnsized<Brc<U, A>> for Brc<T, A>
 where
     T: Unsize<U> + SupportedPointee,
     U: SupportedPointee,
+    A: SingletonAllocator,
 {
 }
 
 // SAFETY: Preserves target and provenance in replace_ptr
-unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> {
+unsafe impl<T, U: ?Sized + SupportedPointee, A: SingletonAllocator> unsize::CoerciblePtr<U>
+    for Brc<T, A>
+{
     type Pointee = T;
-    type Output = Brc<U>;
+    type Output = Brc<U, A>;
 
     #[inline]
     fn as_sized_ptr(&mut self) -> *mut Self::Pointee {
@@ -861,10 +1047,11 @@ unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> 
         // Ownership is correctly transferred from `self` to result.
 
         // Provenance transferred into `raw` as per each individual `into_raw`.
-        let raw = Self::into_raw(self);
+        let (raw, alloc) = Self::into_raw_with_allocator(self);
         // SAFETY: Provenance merged into `new` as per `replace_ptr`.
-        let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
+        let new: *mut U =
+            unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw.cast_mut(), new) };
         // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
-        unsafe { Brc::from_raw(new) }
+        unsafe { Brc::from_raw_in(new, alloc) }
     }
 }
