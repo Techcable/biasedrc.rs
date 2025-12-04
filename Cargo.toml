@@ -35,14 +35,17 @@ name = "basic"
 harness = false
 
 [[bench]]
+path = "benches/rpds/rpds_hash_trie_map.rs"
 name = "rpds_hash_trie_map"
 harness = false
 
 [[bench]]
+path = "benches/rpds/rpds_hash_trie_map_brc.rs"
 name = "rpds_hash_trie_map_brc"
 harness = false
 
 [[bench]]
+path = "benches/rpds/rpds_hash_trie_map_sync.rs"
 name = "rpds_hash_trie_map_sync"
 harness = false
 
