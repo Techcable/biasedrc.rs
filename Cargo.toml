@@ -50,6 +50,36 @@ name = "rpds_hash_trie_map_sync"
 harness = false
 
 [[bench]]
+path = "benches/rpds/rpds_list.rs"
+name = "rpds_list"
+harness = false
+
+[[bench]]
+path = "benches/rpds/rpds_list_brc.rs"
+name = "rpds_list_brc"
+harness = false
+
+[[bench]]
+path = "benches/rpds/rpds_list_sync.rs"
+name = "rpds_list_sync"
+harness = false
+
+[[bench]]
+path = "benches/rpds/rpds_vector.rs"
+name = "rpds_vector"
+harness = false
+
+[[bench]]
+path = "benches/rpds/rpds_vector_brc.rs"
+name = "rpds_vector_brc"
+harness = false
+
+[[bench]]
+path = "benches/rpds/rpds_vector_sync.rs"
+name = "rpds_vector_sync"
+harness = false
+
+[[bench]]
 name = "persistent_hashmap"
 path = "benches/imbl/persistent_hashmap.rs"
 harness = false
