@@ -27,6 +27,8 @@ archery = "1"
 triomphe = "0.1"
 rpds = "1.2"
 criterion = "0.8"
+imbl = "6.1"
+rand = { version = "0.9", features = ["small_rng"] }
 
 [[bench]]
 name = "basic"
@@ -42,6 +44,21 @@ harness = false
 
 [[bench]]
 name = "rpds_hash_trie_map_sync"
+harness = false
+
+[[bench]]
+name = "persistent_hashmap"
+path = "benches/imbl/persistent_hashmap.rs"
+harness = false
+
+[[bench]]
+name = "persistent_ordmap"
+path = "benches/imbl/persistent_ordmap.rs"
+harness = false
+
+[[bench]]
+name = "persistent_vector"
+path = "benches/imbl/persistent_vector.rs"
 harness = false
 
 [profile.bench]
