@@ -259,8 +259,15 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         // SAFETY: Allocated pointer is valid and never null
         unsafe { Self::from_raw(value_ptr) }
     }
+
     /// Create a [`Brc`] from a raw pointer,
-    /// similar to [`std::sync::Arc::from_raw`].
+    /// originating from [`Brc::into_raw`].
+    ///
+    /// Mirrors [`Arc::from_raw`].
+    ///
+    /// See also [`Brc::decrement_strong_count`], which directly mutates the reference count
+    /// without creating a owned value.
+    /// This is subject to roughly the same safety requirements.
     ///
     /// # Safety
     /// This must correspond exactly to an owned reference count from [`Brc::into_raw`],
@@ -365,8 +372,9 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         }
     }
 
-    /// Convert this [`Brc`] into a raw pointer,
-    /// similar to [`std::sync::Arc::into_raw`].
+    /// Consumes this [`Brc`], converting it into a raw pointer.
+    ///
+    /// Mirrors [`Arc::into_raw`].
     ///
     /// # Safety
     /// This is perfectly safe, but may leak memory.
@@ -378,6 +386,56 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub fn into_raw(this: Self) -> *const T {
         let value = ManuallyDrop::new(this);
         value.ptr.as_ptr().cast_const()
+    }
+
+    /// Convert this [`Brc`] into a raw pointer,
+    /// without affecting the reference count.
+    ///
+    /// Mirrors [`Arc::as_ptr`].
+    ///
+    /// This will give the same result as [`Self::into_raw`] would,
+    /// but does not consume ownership.
+    ///
+    /// # Panics
+    /// This function is infallible.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "inherent method could conflict with deref"
+    )]
+    #[inline]
+    pub fn as_ptr(this: &Self) -> *const T {
+        this.ptr.as_ptr().cast_const()
+    }
+
+    /// Increments the strong reference count on the [`Brc`] associated with the specified pointer.
+    ///
+    /// Mirrors [`Brc::increment_strong_count`]
+    ///
+    /// # Safety
+    /// The pointer must have been obtained through [`Brc::into_raw`] or [`Brc::as_ptr`],
+    /// have the correct type, and still point to valid memory (not dropped).
+    #[inline]
+    pub unsafe fn increment_strong_count(ptr: *const T) {
+        // SAFETY: Caller guarantees the pointer is valid
+        let this = ManuallyDrop::new(unsafe { Self::from_raw(ptr) });
+        std::mem::forget(Brc::clone(&*this));
+    }
+
+    /// Decrements the strong reference count on the [`Brc`] associated with the specified pointer.
+    ///
+    /// Mirrors [`Arc::decrement_strong_count`].
+    ///
+    /// # Safety
+    /// The pointer must have been obtained through [`Brc::into_raw`] or [`Brc::as_ptr`],
+    /// have the correct type, and still point to valid memory (not dropped).
+    ///
+    /// Each decrement must match a corresponding increment,
+    /// or else use after free must occur.
+    /// Must not decrement the last reference count while other [`Brc`] references are active.
+    #[inline]
+    pub unsafe fn decrement_strong_count(ptr: *const T) {
+        // SAFETY: Caller guarantees pointer is active, corresponds to a real Brc
+        drop(unsafe { Brc::from_raw(ptr) });
     }
 
     #[inline]
