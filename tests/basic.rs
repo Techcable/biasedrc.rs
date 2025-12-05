@@ -1,9 +1,9 @@
 //! Basic smoke tests.
 
 use biasedrc::Brc;
-use std::cell::Cell;
 use std::error::Error;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU32, Ordering};
 use unsize::{CoerceUnsize, CoerciblePtr};
 
 /// Tests that allocation works, without testing [`Clone`].
@@ -23,12 +23,12 @@ fn alloc_string() {
 
 #[test]
 fn count_drop() {
-    let count = Cell::new(0);
+    let count = AtomicU32::new(0);
     let one = Brc::new(DropCounter(&count));
     let two = Brc::clone(&one);
     drop(one);
     drop(two);
-    assert_eq!(count.get(), 1);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -96,26 +96,35 @@ fn nightly_coerce() {
     check_error(coerce(Brc::new(err)));
 }
 
-struct DropCounter<'a>(&'a Cell<u32>);
+struct DropCounter<'a>(&'a AtomicU32);
 impl Drop for DropCounter<'_> {
     fn drop(&mut self) {
-        self.0.update(|x| x + 1);
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                Some(x.checked_add(1).unwrap())
+            });
     }
 }
 
 /// Tests multiple threads, scoped so that it is necessary to add to the queue and merge reference counts.
 #[test]
 fn multithread_requires_merge() {
-    let one = Brc::new(42);
+    let counter = AtomicU32::new(0);
+    let one = Brc::new(DropCounter(&counter));
     std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let two = Brc::clone(&one);
-            drop(one);
-            biasedrc::collect_force();
-            assert_eq!(*two, 42);
-            drop(two);
-        });
+        scope
+            .spawn(move || {
+                let two = Brc::clone(&one);
+                drop(one);
+                biasedrc::collect_force();
+                drop(two);
+            })
+            .join()
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
         biasedrc::collect_force();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     });
 }
 
