@@ -23,6 +23,7 @@ ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = fa
 unsize = "1.1"
 archery = "1"
 serde = { package = "serde_core", version = "1", optional = true }
+arc-swap = { version = "1.7", optional = true }
 
 [dev-dependencies]
 triomphe = "0.1"

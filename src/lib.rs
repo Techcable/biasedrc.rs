@@ -29,6 +29,8 @@ use std::ptr::NonNull;
 #[allow(clippy::disallowed_types, reason = "only used for docs")]
 use std::sync::Arc;
 
+#[cfg(feature = "arc-swap")]
+mod arc_swap;
 mod runtime;
 #[cfg(feature = "serde")]
 mod serde;
