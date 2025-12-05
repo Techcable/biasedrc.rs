@@ -271,10 +271,10 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// # Panics
     /// This function is infallible.
     #[inline]
-    pub unsafe fn from_raw(ptr: *mut T) -> Brc<T> {
+    pub unsafe fn from_raw(ptr: *const T) -> Brc<T> {
         Brc {
             // SAFETY: Cannot be null as it comes from `into_raw`
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
             marker: PhantomData,
         }
     }
@@ -375,9 +375,9 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// This function is infallible.
     #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
     #[inline]
-    pub fn into_raw(this: Self) -> *mut T {
+    pub fn into_raw(this: Self) -> *const T {
         let value = ManuallyDrop::new(this);
-        value.ptr.as_ptr()
+        value.ptr.as_ptr().cast_const()
     }
 
     #[inline]
@@ -862,8 +862,8 @@ unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> 
         //
         // Ownership is correctly transferred from `self` to result.
 
-        // Provenance transferred into `raw` as per each individual `into_raw`.
-        let raw = Self::into_raw(self);
+        // Provenance transferred into `raw` as per `into_raw`.
+        let raw = Self::into_raw(self).cast_mut();
         // SAFETY: Provenance merged into `new` as per `replace_ptr`.
         let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
         // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
