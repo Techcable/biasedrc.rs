@@ -11,6 +11,22 @@ use std::sync::atomic::Ordering;
 
 mod threads;
 
+/// An error returned by [`Brc::biased_count`],
+/// either caused by being the wrong thread or not being biased at all.
+///
+/// This is an internal type intended only for testing,
+/// just like [`Brc::biased_count`].
+///
+/// [`Brc::biased_count`]: crate::Brc::biased_count
+#[derive(Debug, Clone, thiserror::Error, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum BiasedCountError {
+    #[error("Wrong thread cannot access biased count")]
+    WrongThread,
+    #[error("Reference is no longer biased")]
+    NotBiased,
+}
+
 /// An error returned by [`Brc::strong_count`](crate::Brc::strong_count)
 /// if the reference count cannot be precisely determined.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -205,6 +221,26 @@ impl RawBrcHeader {
             Ok(count) => count == 1,
             Err(ImpreciseRefCountError { .. }) => false, // be conservative
         }
+    }
+
+    #[inline]
+    pub fn biased_count(&self) -> Result<usize, BiasedCountError> {
+        let this_thread_id = LocalThreadState::existing_short_id().ok();
+        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+        if biased_word.owner_id.is_none() {
+            Err(BiasedCountError::NotBiased)
+        } else if this_thread_id == biased_word.owner_id {
+            Ok(biased_word.biased_count.value() as usize)
+        } else {
+            Err(BiasedCountError::WrongThread)
+        }
+    }
+
+    #[inline]
+    pub fn shared_count(&self) -> isize {
+        SharedWord::from_raw(self.shared_word.load(Ordering::Acquire))
+            .shared_count
+            .value() as isize
     }
 
     #[inline]

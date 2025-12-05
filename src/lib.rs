@@ -37,7 +37,7 @@ mod serde;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 
-pub use crate::runtime::{ImpreciseRefCountError, collect, collect_force};
+pub use crate::runtime::{BiasedCountError, ImpreciseRefCountError, collect, collect_force};
 
 struct LayoutInfo {
     value_offset: isize,
@@ -313,6 +313,32 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     #[inline]
     pub fn is_unique(this: &Self) -> bool {
         this.header().is_unique()
+    }
+
+    /// Return the biased reference count,
+    /// or an error if that is not possible or sensible.
+    ///
+    /// This method is intended only for testing.
+    #[doc(hidden)]
+    pub fn biased_count(this: &Self) -> Result<usize, BiasedCountError> {
+        this.header().biased_count()
+    }
+
+    /// Return the shared reference count.
+    ///
+    /// This method is intended only for testing.
+    #[doc(hidden)]
+    pub fn shared_count(this: &Self) -> isize {
+        this.header().shared_count()
+    }
+
+    /// Return the biased and shared reference counts.
+    ///
+    /// This is a utility method equivalent to `(Self::biased_count(this), Self::shared_count(this))`.
+    /// It is intended only for testing.
+    #[doc(hidden)]
+    pub fn biased_and_shared_counts(this: &Self) -> (Result<usize, BiasedCountError>, isize) {
+        (Self::biased_count(this), Self::shared_count(this))
     }
 
     /// Return a mutable reference to the value in this [`Brc`],

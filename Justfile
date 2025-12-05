@@ -4,6 +4,9 @@ test: _check && check-format
     cargo nextest run --all-features
     cargo +stable nextest run
 
+coverage: _check
+    cargo llvm-cov nextest --all-features
+
 # Due to use of header arithmeitc, we cannot pass stacked borrows yet,
 # only tree borrows
 export MIRIFLAGS := "-Zmiri-tree-borrows -Zmiri-env-forward=RUST_BACKTRACE"

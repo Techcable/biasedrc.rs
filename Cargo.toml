@@ -31,6 +31,7 @@ rpds = "1.2"
 criterion = "0.8"
 imbl = "6.1"
 rand = { version = "0.9", features = ["small_rng"] }
+crossbeam-channel = "0.5"
 
 [[bench]]
 name = "basic"
