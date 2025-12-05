@@ -30,6 +30,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 mod runtime;
+#[cfg(feature = "serde")]
+mod serde;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 

@@ -22,6 +22,7 @@ stable_deref_trait = "1.2"
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 unsize = "1.1"
 archery = "1"
+serde = { package = "serde_core", version = "1", optional = true }
 
 [dev-dependencies]
 triomphe = "0.1"
@@ -108,6 +109,8 @@ nightly-ptr-meta = []
 # Removing this feature could break some code,
 # but adding it never will.
 nightly-coerce = []
+# Enable serde serialization support
+serde = ["dep:serde"]
 
 [lints.rust]
 missing-docs = "warn"
