@@ -4,7 +4,7 @@ use atomic::Atomic;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 use crossbeam_queue::SegQueue;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use parking_lot::Mutex;
 use std::cell::Cell;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::ops::Deref;
@@ -28,7 +28,7 @@ impl UniqueThreadId {
     }
 }
 
-#[derive(Copy, Clone, Debug, bytemuck::NoUninit)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, bytemuck::NoUninit)]
 #[repr(u8)]
 enum ThreadStateFlag {
     /// Indicates that a thread is alive,
@@ -36,36 +36,32 @@ enum ThreadStateFlag {
     Live = 0,
     /// Indicates that a thread is both alive and has queued objects.
     QueuedObjects,
-    /// Indicates the thread needs to die,
-    /// and cleanup code must be executed.
+    /// Indicates the thread is currently executing its destructor.
     ///
-    /// Used to avoid blocking in a thread destructor.
-    /// After this state is observed,
-    /// the first thread to successfully acquire the lock is expected to perform the cleanup.
+    /// While this state is present, the death lock must not be acquired.
+    /// Otherwise, other threads could block the thread destructor.
     ///
     /// This state implies that [`LocalThreadState::current`] will never succeed again,
     /// ensuring the biased thread will not manipulate the shared count.
     Dying,
-    /// Indicates that the thread is dead and has been cleaned up.
+    /// Indicates that the thread is dead and has finished executing the destructor.
+    ///
+    /// This means that the queue will never be emptied,
+    /// but the .
     Dead,
 }
+impl ThreadStateFlag {
+    #[inline]
+    pub fn is_live(self) -> bool {
+        match self {
+            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => true,
+            ThreadStateFlag::Dying | ThreadStateFlag::Dead => false,
+        }
+    }
+}
 
-/// The choice of concurrent queue means we only need a read lock on [`SharedThreadState`] to append to the queue.
-///
-/// This improves concurrency but increases memory usage and the cost of a append operation.
-/// The [`LocalThreadState`] holds a cached pointer to the queue,
-/// as the lock only prevents destruction and destruction will not happen while [`LocalThreadState`] is live.
+/// The queue of objects to be merged by the biased thread.
 type ObjectQueue = SegQueue<QueuedObject>;
-
-/// The state shared across multiple threads and protected by a [`RwLock`].
-///
-/// Used to prevent use after free for the queue.
-/// If the [`ThreadStateFlag::Dying`] flag is set,
-/// it ensures that only one thread actually does the destruction.
-enum SharedThreadState {
-    Live { queued_objects: Box<ObjectQueue> },
-    Dead,
-}
 
 /// Information about a particular thread participating in BRC,
 /// which is safe to share with other threads.
@@ -83,10 +79,18 @@ pub struct SharedThreadInfo {
     short_id: ShortThreadId,
     /// Indicates the state of the thread.
     state_flag: Atomic<ThreadStateFlag>,
-    /// The current state of the thread, potentially including the queue.
+    /// The queue of objects that need to be processed.
+    queued_objects: ObjectQueue,
+    /// After a thread dies, it can no longer process its own biased objects.
     ///
-    /// Protected by a lock to prevent unexpected state transitions.
-    shared_state: RwLock<SharedThreadState>,
+    /// This means that other threads must do the processing themselves.
+    /// However, multiple threads processing the same object would trigger UB.
+    ///
+    /// Hence, once the thread is dead, this lock needs to be acquired
+    /// before processing any objects.
+    ///
+    /// TODO: Does the fact `queue_object` is called exactly once obliviate the need for locking?
+    dead_processing_lock: Mutex<()>,
 }
 impl SharedThreadInfo {
     #[inline]
@@ -94,87 +98,47 @@ impl SharedThreadInfo {
         THREADS.get(id.index())?.ok()
     }
 
+    /// Queue the object, with special fallback behavior on thread death.
+    ///
+    /// TODO: This can only be called exactly once per object.
+    /// Is that sufficient to handle ?
+    ///
+    /// # Safety
+    /// The queued object must be valid.
     #[cold]
-    pub unsafe fn queue_object(
-        &self,
-        object: QueuedObject,
-    ) -> Result<(), InvalidSharedThreadError> {
-        // don't do an upgradable_read here because that reduces concurrency
-        // acquiring a read lock here means that the thread will not die while we are working
-        let lock = self.shared_state.read();
-        let current_flag = self.state_flag.load(Ordering::Relaxed);
-        match current_flag {
-            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
-                let SharedThreadState::Live { queued_objects } = &*lock else {
-                    unreachable!("flag doesn't match state")
-                };
-                queued_objects.push(object);
-                // It's fine to do a relaxed load because we don't care when the biased thread acknowledges.
-                // Also, releasing the lock will do release fence anyway.
-                self.state_flag
-                    .store(ThreadStateFlag::QueuedObjects, Ordering::Relaxed);
-                RwLockReadGuard::unlock_fair(lock);
-                Ok(())
-            }
-            ThreadStateFlag::Dying => {
-                drop(lock); // don't care if this unlock is fair
-                let lock = self.shared_state.upgradable_read();
-                let current_flag = self.state_flag.load(Ordering::Relaxed);
-                match current_flag {
-                    ThreadStateFlag::Dying => {
-                        let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
-                        // SAFETY: We have been requested to destroy the info
-                        unsafe {
-                            self.do_destroy_shared(&mut lock);
-                        }
-                        RwLockWriteGuard::unlock_fair(lock);
-                        // flag unchanged, so it is our responsibility to fix it
-                        Err(InvalidSharedThreadError::DeadOrDying)
-                    }
-                    ThreadStateFlag::Dead => {
-                        RwLockUpgradableReadGuard::unlock_fair(lock);
-                        // someone else dealt with the death, so we are done
-                        Err(InvalidSharedThreadError::DeadOrDying)
-                    }
-                    ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
-                        unreachable!("impossible to transition from dying to {current_flag:?}")
-                    }
-                }
-            }
-            ThreadStateFlag::Dead => Err(InvalidSharedThreadError::DeadOrDying),
+    pub unsafe fn queue_object(&self, object: QueuedObject) {
+        self.queued_objects.push(object);
+        let actual_state = self
+            .state_flag
+            .compare_exchange(
+                ThreadStateFlag::Live,
+                ThreadStateFlag::QueuedObjects,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .unwrap_or_else(core::convert::identity);
+        match actual_state {
+            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {}
+            ThreadStateFlag::Dying | ThreadStateFlag::Dead => self.process_dead(),
         }
     }
 
-    /// Destroy the shared thread info.
-    ///
-    /// # Safety
-    /// The thread must actually be dead or dying,
-    /// otherwise concurrent access to the biased counter will trigger undefined behavior.
+    /// Process queued objects in the case where the thread is dead or dying.
     #[cold]
-    #[inline(never)]
-    unsafe fn do_destroy_shared(&self, lock: &mut RwLockWriteGuard<'_, SharedThreadState>) {
-        match &**lock {
-            SharedThreadState::Live { queued_objects } => {
-                // SAFETY: We are either directly executing in a destructure on the biased thread,
-                // or the destructor has already finished and flagged a request to be killed,
-                // and our write access to the state lock gives us the exclusive permission to finish the cleanup.
-                // Either way, we cannot conflict with RC operations on that thread,
-                // as the state has been marked as dead
-                unsafe {
-                    self.do_empty_queue(queued_objects);
-                }
-                let old_state = self
-                    .state_flag
-                    .swap(ThreadStateFlag::Dead, Ordering::Relaxed);
-                match old_state {
-                    ThreadStateFlag::Live
-                    | ThreadStateFlag::QueuedObjects
-                    | ThreadStateFlag::Dying => {}
-                    ThreadStateFlag::Dead => unreachable!("{old_state:?}"),
-                }
-                **lock = SharedThreadState::Dead;
+    fn process_dead(&self) {
+        let state = self.state_flag.load(Ordering::Acquire);
+        match state {
+            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => unreachable!(),
+            ThreadStateFlag::Dying => {
+                // the thread destructor is running,
+                // so it is responsible for handling this
             }
-            SharedThreadState::Dead => unreachable!("already dead"),
+            ThreadStateFlag::Dead => {
+                let guard = self.dead_processing_lock.lock();
+                // SAFETY: Thread is dead and the lock prevents concurrent modification
+                unsafe { self.do_empty_queue() }
+                drop(guard);
+            }
         }
     }
 
@@ -182,11 +146,12 @@ impl SharedThreadInfo {
     ///
     /// # Safety
     /// Same requirements as [`super::explicit_merge`].
-    /// In particular, this can only be done on the biased thread or after the biased thread dies.
+    /// In particular, this can only be done on the biased thread if the biased thread is live.
+    /// If the biased thread is dead, it can only be done while holding the lock.
     #[cold]
     #[inline(never)]
-    unsafe fn do_empty_queue(&self, queued_objects: &ObjectQueue) {
-        while let Some(object) = queued_objects.pop() {
+    unsafe fn do_empty_queue(&self) {
+        while let Some(object) = self.queued_objects.pop() {
             // SAFETY: Caller guarantees this is a safe to do
             unsafe {
                 super::explicit_merge(self.short_id, object);
@@ -196,8 +161,8 @@ impl SharedThreadInfo {
         let _ = self.state_flag.compare_exchange(
             ThreadStateFlag::QueuedObjects,
             ThreadStateFlag::Live,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
         );
     }
 }
@@ -305,8 +270,6 @@ impl LocalThreadState {
                     state.shared_info.state_flag.load(Ordering::Relaxed),
                     ThreadStateFlag::Live
                 ) {
-                    // we don't really need to worry about lock contention here,
-                    // because it should only be write-locked if the thread is dying
                     state.collect_force();
                 }
             });
@@ -320,14 +283,14 @@ impl LocalThreadState {
     #[inline(never)]
     pub fn collect_force(&self) {
         nounwind::abort_unwind(|| {
-            let lock = self.shared_info.shared_state.read();
-            match *lock {
-                SharedThreadState::Live { ref queued_objects } => {
-                    // SAFETY: We are the biased thread, so can safely adjust the RCs
-                    unsafe { self.shared_info.do_empty_queue(queued_objects) };
+            let this_state = self.shared_info.state_flag.load(Ordering::Acquire);
+            match this_state {
+                ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
+                    // SAFETY: We are the biased thread, so can safely adjust the RCs without a lock
+                    unsafe { self.shared_info.do_empty_queue() };
                 }
-                SharedThreadState::Dead => {
-                    // nothing more to do
+                ThreadStateFlag::Dead | ThreadStateFlag::Dying => {
+                    // do nothing, as this can only happen in a destructor
                 }
             }
         });
@@ -343,27 +306,41 @@ impl Drop for LocalThreadState {
             assert_eq!(fast.short_id.replace(None), Some(self.short_id));
             fast.shared_state_flag.set(&DUMMY_STATE_FLAG);
         });
-        // now attempt to destroy the thread
-        match self.shared_info.shared_state.try_write() {
-            Some(mut success) => {
-                // SAFETY: We are the owning thread
-                unsafe {
-                    self.shared_info.do_destroy_shared(&mut success);
-                }
-            }
-            None => {
-                let old_state = self
-                    .shared_info
-                    .state_flag
-                    .swap(ThreadStateFlag::Dying, Ordering::SeqCst);
-                match old_state {
-                    ThreadStateFlag::Dying | ThreadStateFlag::Dead => {
-                        panic!("cannot kill a thread in state {old_state:?}")
-                    }
-                    ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {}
-                }
-            }
+        {
+            let old_state = self
+                .shared_info
+                .state_flag
+                .swap(ThreadStateFlag::Dying, Ordering::SeqCst);
+            assert!(old_state.is_live(), "{old_state:?}");
         }
+        let processing_guard = self
+            .shared_info
+            .dead_processing_lock
+            .try_lock()
+            .expect("processing lock should not be acquired until officially dead");
+        // first pass processing queued objects
+        // SAFETY: We are the biased thread (and also hold the lock)
+        unsafe {
+            self.shared_info.do_empty_queue();
+        }
+        // we have the lock, so can officially switch to the "dead" state
+        // this means other threads will block while we are finishing up
+        assert_eq!(
+            self.shared_info.state_flag.compare_exchange(
+                ThreadStateFlag::Dying,
+                ThreadStateFlag::Dead,
+                Ordering::SeqCst,
+                Ordering::SeqCst
+            ),
+            Ok(ThreadStateFlag::Dying),
+        );
+        // do a second pass through the queue, emptying anything we missed the first time
+        // SAFETY: We hold the lock, preventing other threads from proceeding
+        unsafe {
+            self.shared_info.do_empty_queue();
+        }
+        // free the lock to allow other threads to process things
+        drop(processing_guard);
     }
 }
 /// The status of the local thread state.
@@ -443,7 +420,8 @@ fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
                     _id: id,
                     short_id,
                     state_flag: Atomic::new(ThreadStateFlag::Live),
-                    shared_state: RwLock::new(SharedThreadState::Live { queued_objects }),
+                    queued_objects: ObjectQueue::new(),
+                    dead_processing_lock: Mutex::new(()),
                 }))),
                 Err(ThreadIdOverflowError) => {
                     // prevent other threads from attempting this
@@ -481,12 +459,6 @@ pub enum ThreadStateInitError {
     AlreadyDied,
     #[error("Failed to initialize thread: {0}")]
     IdOverflow(#[from] ThreadIdOverflowError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum InvalidSharedThreadError {
-    #[error("Thread is either dead or dying")]
-    DeadOrDying,
 }
 
 #[derive(Copy, Clone, Debug, thiserror::Error, Eq, PartialEq)]

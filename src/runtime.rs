@@ -1,6 +1,4 @@
-use crate::runtime::threads::{
-    InvalidSharedThreadError, LocalThreadAccessError, LocalThreadState, ShortThreadId,
-};
+use crate::runtime::threads::{LocalThreadAccessError, LocalThreadState, ShortThreadId};
 use arbitrary_int::prelude::*;
 use core::marker::PhantomPinned;
 use core::sync::atomic::AtomicU32;
@@ -428,27 +426,13 @@ impl RawBrcHeader {
                 .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
             // SAFETY: The refcnt guarantees the header will not be dropped,
             // and the caller guarantees the drop information is valid
-            match unsafe {
+            unsafe {
                 threads::SharedThreadInfo::get_by_id(owner_id)
                     .unwrap_or_else(|| undefined_behavior::owner_undefined_state())
                     .queue_object(QueuedObject {
                         header_ptr: NonNull::from(self),
                         drop: drop.clone(),
-                    })
-            } {
-                Ok(()) => {}
-                Err(InvalidSharedThreadError::DeadOrDying) => {
-                    // SAFETY: Since the thread is dead, we can do the explicit merge
-                    unsafe {
-                        self::explicit_merge(
-                            owner_id,
-                            QueuedObject {
-                                header_ptr: NonNull::from(self),
-                                drop,
-                            },
-                        );
-                    }
-                }
+                    });
             }
         } else if new.merged && new.shared_count.value() == 0 {
             // SAFETY: Valid to deallocate
