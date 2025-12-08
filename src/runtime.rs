@@ -426,6 +426,8 @@ impl RawBrcHeader {
                 .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
             // SAFETY: The refcnt guarantees the header will not be dropped,
             // and the caller guarantees the drop information is valid
+            //
+            // We also know that this will be called at most once due to the successful CAS
             unsafe {
                 threads::SharedThreadInfo::get_by_id(owner_id)
                     .unwrap_or_else(|| undefined_behavior::owner_undefined_state())

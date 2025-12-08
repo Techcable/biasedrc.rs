@@ -1,14 +1,14 @@
+#![allow(clippy::disallowed_types, reason = "Need Arc to hold queue")]
 use crate::runtime::QueuedObject;
 use arbitrary_int::prelude::*;
 use atomic::Atomic;
-use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::ops::Deref;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::thread::AccessError;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -58,10 +58,72 @@ impl ThreadStateFlag {
             ThreadStateFlag::Dying | ThreadStateFlag::Dead => false,
         }
     }
+    #[inline]
+    pub fn is_dead_or_dying(self) -> bool {
+        !self.is_live()
+    }
 }
 
 /// The queue of objects to be merged by the biased thread.
-type ObjectQueue = SegQueue<QueuedObject>;
+///
+/// # Safety
+/// If this queue is [dropped](drop),
+/// the remaining queued objects will be implicitly processed.
+/// This the
+pub struct ObjectQueue {
+    short_id: ShortThreadId,
+    inner: SegQueue<QueuedObject>,
+}
+impl ObjectQueue {
+    /// Create a new queue,
+    /// guaranteeing drop will not occur while the biased thread is live.
+    ///
+    /// # Safety
+    /// The [`Drop`] implementation of the queue must not be called unless
+    /// [`super::explicit_merge`] can be safely called on all the objects in the queue.
+    #[inline]
+    pub unsafe fn new(short_id: ShortThreadId) -> ObjectQueue {
+        ObjectQueue {
+            short_id,
+            inner: SegQueue::new(),
+        }
+    }
+
+    /// Push an object onto the queue.
+    ///
+    /// # Safety
+    /// The queued object is valid.
+    ///
+    /// Should only be called by [`SharedThreadInfo::queue_object`].
+    #[inline]
+    pub unsafe fn push(&self, object: QueuedObject) {
+        self.inner.push(object);
+    }
+
+    /// Empty the queue by repeatedly calling [`super::explicit_merge`].
+    ///
+    /// # Safety
+    /// Same requirements as [`super::explicit_merge`].
+    /// In particular, if the biased thread is live,
+    ///that is the only thread this can be done on.
+    #[cold]
+    #[inline(never)]
+    unsafe fn do_process(&self) {
+        while let Some(object) = self.inner.pop() {
+            // SAFETY: Caller guarantees this is a safe to do
+            unsafe {
+                super::explicit_merge(self.short_id, object);
+            }
+        }
+    }
+}
+impl Drop for ObjectQueue {
+    fn drop(&mut self) {
+        // SAFETY: Our destruction can only happen once it is safe to process the objects
+        // This is guaranteed by the caller of `Self::new`
+        unsafe { self.do_process() }
+    }
+}
 
 /// Information about a particular thread participating in BRC,
 /// which is safe to share with other threads.
@@ -80,17 +142,9 @@ pub struct SharedThreadInfo {
     /// Indicates the state of the thread.
     state_flag: Atomic<ThreadStateFlag>,
     /// The queue of objects that need to be processed.
-    queued_objects: ObjectQueue,
-    /// After a thread dies, it can no longer process its own biased objects.
     ///
-    /// This means that other threads must do the processing themselves.
-    /// However, multiple threads processing the same object would trigger UB.
-    ///
-    /// Hence, once the thread is dead, this lock needs to be acquired
-    /// before processing any objects.
-    ///
-    /// TODO: Does the fact `queue_object` is called exactly once obliviate the need for locking?
-    dead_processing_lock: Mutex<()>,
+    /// This will be freed on thread death.
+    queued_objects: Weak<ObjectQueue>,
 }
 impl SharedThreadInfo {
     #[inline]
@@ -98,72 +152,55 @@ impl SharedThreadInfo {
         THREADS.get(id.index())?.ok()
     }
 
-    /// Queue the object, with special fallback behavior on thread death.
-    ///
-    /// TODO: This can only be called exactly once per object.
-    /// Is that sufficient to handle ?
+    /// Queue the object if the biased thread is live,
+    /// or call [`super::explicit_merge`] if the thread is dead.
     ///
     /// # Safety
+    /// Must be called at most once per object,
+    /// or else a data race could occur.
+    ///
     /// The queued object must be valid.
+    ///
+    /// # Panics
+    /// This function is infallible, but may abort if internal corruption is discovered.
     #[cold]
     pub unsafe fn queue_object(&self, object: QueuedObject) {
-        self.queued_objects.push(object);
-        let actual_state = self
-            .state_flag
-            .compare_exchange(
-                ThreadStateFlag::Live,
-                ThreadStateFlag::QueuedObjects,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .unwrap_or_else(core::convert::identity);
-        match actual_state {
-            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {}
-            ThreadStateFlag::Dying | ThreadStateFlag::Dead => self.process_dead(),
-        }
-    }
-
-    /// Process queued objects in the case where the thread is dead or dying.
-    #[cold]
-    fn process_dead(&self) {
-        let state = self.state_flag.load(Ordering::Acquire);
-        match state {
-            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => unreachable!(),
-            ThreadStateFlag::Dying => {
-                // the thread destructor is running,
-                // so it is responsible for handling this
+        nounwind::abort_unwind(|| {
+            match self.queued_objects.upgrade() {
+                Some(queue) => {
+                    // SAFETY: Caller guarantees the queue is valid
+                    // Either the thread is live and will later process it,
+                    // or is in the process of being destroyed.
+                    // In the latter case, the queue destructor will handle things.
+                    unsafe {
+                        queue.push(object);
+                    }
+                    // if we are still "live", update the state to indicate the queue is nonempty.
+                    // We don't care about promptness so can use a relaxed ordering.
+                    // This does not matter if we are being destroyed
+                    // since the queue destructor will process the object.
+                    let _ = self.state_flag.compare_exchange(
+                        ThreadStateFlag::Live,
+                        ThreadStateFlag::QueuedObjects,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+                None => {
+                    let this_state = self.state_flag.load(Ordering::Acquire);
+                    assert!(
+                        this_state.is_dead_or_dying(),
+                        "thread is {this_state:?} but has no queue"
+                    );
+                    // SAFETY: The thread is dead or dying, so it cannot mutate the biased count.
+                    // This method is called at most once per object,
+                    // so it cannot possibly race with any other threads.
+                    unsafe {
+                        super::explicit_merge(self.short_id, object);
+                    }
+                }
             }
-            ThreadStateFlag::Dead => {
-                let guard = self.dead_processing_lock.lock();
-                // SAFETY: Thread is dead and the lock prevents concurrent modification
-                unsafe { self.do_empty_queue() }
-                drop(guard);
-            }
-        }
-    }
-
-    /// Empty the queue by repeatedly calling [`super::explicit_merge`].
-    ///
-    /// # Safety
-    /// Same requirements as [`super::explicit_merge`].
-    /// In particular, this can only be done on the biased thread if the biased thread is live.
-    /// If the biased thread is dead, it can only be done while holding the lock.
-    #[cold]
-    #[inline(never)]
-    unsafe fn do_empty_queue(&self) {
-        while let Some(object) = self.queued_objects.pop() {
-            // SAFETY: Caller guarantees this is a safe to do
-            unsafe {
-                super::explicit_merge(self.short_id, object);
-            }
-        }
-        // if we are in queued objects state, switch to the live state
-        let _ = self.state_flag.compare_exchange(
-            ThreadStateFlag::QueuedObjects,
-            ThreadStateFlag::Live,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        });
     }
 }
 
@@ -174,16 +211,17 @@ impl SharedThreadInfo {
 pub struct LocalThreadState {
     shared_info: &'static SharedThreadInfo,
     short_id: ShortThreadId,
-    /// Holds a cached pointer to the queue,
-    /// which allows this thread to avoid acquiring a read lock on the [`SharedThreadState`].
+    /// Holds the primary strong reference to the object queue,
+    /// which will be destroyed and implicitly emptied on thread death.
     ///
-    /// This is possible because the thread cannot be destroyed while the [`LocalThreadState`] is live.
-    /// The lock only exists to prevent use after free,
-    /// and the queue is otherwise fully concurrent.
+    /// We use an [`Arc`] so that the [`Weak`] in the [`SharedThreadInfo`]
+    /// is automatically updated on destruction.
+    /// It is possible that the queue will be kept alive slightly past thread death
+    /// by the [`SharedThreadInfo::queue_object`] function.
+    /// This is fine as long as it is not dropped before the thread death.
     ///
-    /// This has the logical lifetime `&'self`,
-    /// but we use a pointer since that is not currently possible to express.
-    _cached_queue: NonNull<ObjectQueue>,
+    /// This is [`ManuallyDrop`] to be clearer about the invariants of the [`ObjectQueue`].
+    queue: ManuallyDrop<Arc<ObjectQueue>>,
 }
 impl LocalThreadState {
     #[inline]
@@ -244,7 +282,7 @@ impl LocalThreadState {
     #[inline]
     pub fn currently_needs_collect() -> bool {
         THIS_THREAD_STATE_FAST.with(|fast| {
-            // compiles to copmarison against zero
+            // compiles to comparison against zero
             !matches!(
                 fast.shared_state_flag.get().load(Ordering::Relaxed),
                 ThreadStateFlag::Live
@@ -286,11 +324,38 @@ impl LocalThreadState {
             let this_state = self.shared_info.state_flag.load(Ordering::Acquire);
             match this_state {
                 ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
-                    // SAFETY: We are the biased thread, so can safely adjust the RCs without a lock
-                    unsafe { self.shared_info.do_empty_queue() };
+                    // this can still be destroyed if the state
+                    // is changed to dying after we perform the initial read.
+                    // In that case, skip processing, as the destructors handled things.
+                    let Some(queue) = Weak::upgrade(&self.shared_info.queued_objects) else {
+                        return;
+                    };
+                    loop {
+                        // SAFETY: We are the biased thread,
+                        // so can safely adjust the RCs without a lock
+                        unsafe {
+                            queue.do_process();
+                        }
+                        // Update the state to indicate we have processed things.
+                        let _ = self.shared_info.state_flag.compare_exchange(
+                            ThreadStateFlag::QueuedObjects,
+                            ThreadStateFlag::Live,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        // It is possible a race causes us to make a mistake in the line above:
+                        // If we go to sleep after `do_process`
+                        // another thread could add to the queue and
+                        // cause us to ignore its status flag here.
+                        // To avoid this, we check again to see if the queue really is empty.
+                        if queue.inner.is_empty() {
+                            break;
+                        }
+                    }
                 }
                 ThreadStateFlag::Dead | ThreadStateFlag::Dying => {
-                    // do nothing, as this can only happen in a destructor
+                    // do nothing, as the destructor is executing
+                    // and is responsible for handling things
                 }
             }
         });
@@ -298,6 +363,8 @@ impl LocalThreadState {
 }
 impl Drop for LocalThreadState {
     fn drop(&mut self) {
+        // update the local state to indicate we are dead
+        // This should prevent this thread from modifying any biased counters
         THIS_THREAD_STATE_FAST.with(|fast| {
             assert_eq!(
                 fast.status.replace(LocalThreadStatus::DeadOrDying),
@@ -306,41 +373,26 @@ impl Drop for LocalThreadState {
             assert_eq!(fast.short_id.replace(None), Some(self.short_id));
             fast.shared_state_flag.set(&DUMMY_STATE_FLAG);
         });
-        {
-            let old_state = self
-                .shared_info
-                .state_flag
-                .swap(ThreadStateFlag::Dying, Ordering::SeqCst);
-            assert!(old_state.is_live(), "{old_state:?}");
-        }
-        let processing_guard = self
+        // now we can officially switch or shared state flag to "dying"
+        let old_state = self
             .shared_info
-            .dead_processing_lock
-            .try_lock()
-            .expect("processing lock should not be acquired until officially dead");
-        // first pass processing queued objects
-        // SAFETY: We are the biased thread (and also hold the lock)
-        unsafe {
-            self.shared_info.do_empty_queue();
-        }
-        // we have the lock, so can officially switch to the "dead" state
-        // this means other threads will block while we are finishing up
+            .state_flag
+            .swap(ThreadStateFlag::Dying, Ordering::SeqCst);
+        assert!(old_state.is_live(), "Cannot destroy a {old_state:?} thread");
+        // drop the shared reference to the queue
+        // This may not run the destructor immediately if a queue_object call is in progress.
+        // SAFETY: Performed exactly once
+        unsafe { ManuallyDrop::drop(&mut self.queue) };
+        // switch shared state to "dead"
         assert_eq!(
             self.shared_info.state_flag.compare_exchange(
                 ThreadStateFlag::Dying,
                 ThreadStateFlag::Dead,
                 Ordering::SeqCst,
-                Ordering::SeqCst
+                Ordering::SeqCst,
             ),
             Ok(ThreadStateFlag::Dying),
         );
-        // do a second pass through the queue, emptying anything we missed the first time
-        // SAFETY: We hold the lock, preventing other threads from proceeding
-        unsafe {
-            self.shared_info.do_empty_queue();
-        }
-        // free the lock to allow other threads to process things
-        drop(processing_guard);
     }
 }
 /// The status of the local thread state.
@@ -411,18 +463,22 @@ fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
     if SHORT_THREAD_IDS_EXHAUSTED.load(Ordering::Acquire) {
         Err(ThreadIdOverflowError.into())
     } else {
-        let queued_objects = Box::new(SegQueue::new());
-        let cached_queue = NonNull::from(queued_objects.deref());
+        let mut queued_objects = None;
         let index = THREADS.push_with(|id| {
             let id = UniqueThreadId::from_index(id);
             match ShortThreadId::try_from(id) {
-                Ok(short_id) => Ok(Box::leak(Box::new(SharedThreadInfo {
-                    _id: id,
-                    short_id,
-                    state_flag: Atomic::new(ThreadStateFlag::Live),
-                    queued_objects: ObjectQueue::new(),
-                    dead_processing_lock: Mutex::new(()),
-                }))),
+                Ok(short_id) => {
+                    // SAFETY: Destructor is only called when the thread dies
+                    // or if this function panics
+                    // In the latter case, no objects will have been queued.
+                    queued_objects = Some(Arc::new(unsafe { ObjectQueue::new(short_id) }));
+                    Ok(Box::leak(Box::new(SharedThreadInfo {
+                        _id: id,
+                        short_id,
+                        state_flag: Atomic::new(ThreadStateFlag::Live),
+                        queued_objects: Arc::downgrade(queued_objects.as_ref().unwrap()),
+                    })))
+                }
                 Err(ThreadIdOverflowError) => {
                     // prevent other threads from attempting this
                     SHORT_THREAD_IDS_EXHAUSTED.store(true, Ordering::Release);
@@ -448,7 +504,7 @@ fn init_thread() -> Result<LocalThreadState, ThreadStateInitError> {
         Ok(LocalThreadState {
             shared_info,
             short_id: shared_info.short_id,
-            _cached_queue: cached_queue,
+            queue: ManuallyDrop::new(queued_objects.unwrap()),
         })
     }
 }
