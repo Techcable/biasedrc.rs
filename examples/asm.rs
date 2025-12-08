@@ -6,6 +6,7 @@
 )]
 
 use biasedrc::Brc;
+use std::fmt::Debug;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -59,6 +60,18 @@ pub fn rc_drop(x: Rc<u32>) {
     drop(x);
 }
 
+macro_rules! pretend_used_simple {
+    ($($func:ident),+ $(,)?) => {
+        $(used(&($func as fn(_) -> _));)*
+    };
+}
 pub fn main() {
-    unimplemented!()
+    #[inline(never)]
+    fn used(x: &dyn Debug) {
+        println!("used: {:?}", core::hint::black_box(x));
+    }
+    pretend_used_simple!(
+        brc_new, arc_new, rc_new, brc_clone, arc_clone, rc_clone, brc_drop, arc_drop, rc_drop
+    );
+    used(&(brc_collect as fn()));
 }
