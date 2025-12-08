@@ -35,6 +35,15 @@ pub struct ImpreciseRefCountError {
     lower_bound: usize,
 }
 
+/// The result of calling [`RawBrcHeader::decrement_strong`],
+/// indicating whether the value needs to be dropped.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct StrongDecrementResult {
+    /// If the value should be dropped,
+    /// as there are no more references.
+    pub should_drop: bool,
+}
+
 /// The object header for a [`Brc`].
 ///
 /// Separated from the [`Brc`] to allow more detailed control of allocation.
@@ -297,10 +306,14 @@ impl RawBrcHeader {
     /// The header must have been previously constructed using [`Self::init`],
     /// which allows skipping some initialization checks.
     #[inline]
-    pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) {
-        // SAFETY: Caller guarantees drop function is valid and RC is owned
-        match unsafe { self.decrement_biased(drop) } {
-            Ok(()) => {} // nothing more to do
+    pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) -> StrongDecrementResult {
+        // SAFETY: The RC is owned
+        match unsafe { self.decrement_biased() } {
+            Ok(res) => {
+                // successfully executed biased decrement,
+                // return info on whether a drop is needed
+                res
+            }
             Err(FastDecrementFailure) => {
                 // SAFETY: Caller guarantees drop function is valid and RC is owned
                 unsafe { self.decrement_shared(drop) }
@@ -309,7 +322,7 @@ impl RawBrcHeader {
     }
 
     #[inline]
-    unsafe fn decrement_biased<D: DropInfo>(&self, drop: D) -> Result<(), FastDecrementFailure> {
+    unsafe fn decrement_biased(&self) -> Result<StrongDecrementResult, FastDecrementFailure> {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         let owner_id = biased_word.owner_id.ok_or(FastDecrementFailure)?;
         let this_id = match LocalThreadState::existing_short_id() {
@@ -341,13 +354,10 @@ impl RawBrcHeader {
                     .to_raw(),
                     Ordering::Relaxed,
                 );
-                Ok(())
+                Ok(StrongDecrementResult { should_drop: false })
             } else {
                 // SAFETY: We have already verified that we are the biased thread
-                unsafe {
-                    self.decrement_biased_slow::<D>(drop);
-                }
-                Ok(())
+                unsafe { Ok(self.decrement_biased_slow()) }
             }
         } else {
             Err(FastDecrementFailure)
@@ -364,7 +374,7 @@ impl RawBrcHeader {
     /// and that it is still "biased".
     #[cold]
     #[inline(never)] // inlining this seems to harm performance
-    unsafe fn decrement_biased_slow<D: DropInfo>(&self, drop: D) {
+    unsafe fn decrement_biased_slow(&self) -> StrongDecrementResult {
         let old_shared = SharedWord::from_raw(
             self.shared_word
                 .fetch_or(SharedWord::MERGED_BIT, Ordering::AcqRel),
@@ -376,20 +386,21 @@ impl RawBrcHeader {
             ..old_shared
         };
         debug_assert!(new_shared.shared_count.value() >= 0);
+        let should_drop: bool;
         if new_shared.shared_count.value() == 0 {
-            let header_ptr = NonNull::from(self);
-            // SAFETY: The pointer is valid, and it is time to deallocate
-            unsafe { drop.dealloc(header_ptr) }
+            should_drop = true;
         } else {
             // release ownership
             self.biased_word
                 .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+            should_drop = false;
         }
+        StrongDecrementResult { should_drop }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn decrement_shared<D: DropInfo>(&self, drop: D) {
+    unsafe fn decrement_shared<D: DropInfo>(&self, drop: D) -> StrongDecrementResult {
         let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
         let mut new: SharedWord;
         // TODO: What if we split this into two CAS operations?
@@ -416,16 +427,16 @@ impl RawBrcHeader {
                 Err(x) => old = SharedWord::from_raw(x),
             }
         }
+        let should_drop: bool;
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
             // SAFETY: We now have the exclusive right to queue the object
             unsafe { self.decrement_shared_do_queue(drop) }
-        } else if new.merged && new.shared_count.value() == 0 {
-            // SAFETY: Valid to deallocate
-            unsafe {
-                drop.dealloc(NonNull::from(self));
-            }
+            should_drop = false; // drop handled by queue
+        } else {
+            should_drop = new.merged && new.shared_count.value() == 0;
         }
+        StrongDecrementResult { should_drop }
     }
 
     /// The slow path for [`Self::decrement_shared`],

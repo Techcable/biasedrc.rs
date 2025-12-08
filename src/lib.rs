@@ -506,7 +506,11 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
             marker: PhantomData,
         };
         // SAFETY: We own a reference count and the context is valid
-        unsafe { self.header().decrement_strong(context) }
+        let result = unsafe { self.header().decrement_strong(context) };
+        if result.should_drop {
+            // SAFETY: We trust the drop function to return a valid result
+            unsafe { context.dealloc(NonNull::from(self.header())) }
+        }
     }
 }
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
