@@ -19,6 +19,7 @@ check: _check check-format
 _check:
     cargo clippy --all-targets --all-features
     cargo +stable clippy --all-targets
+    cargo doc --no-deps
 
 format: && spellcheck
     cargo fmt --all

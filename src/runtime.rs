@@ -720,7 +720,7 @@ pub fn collect() {
     }
 }
 
-/// Forcibly perform the [`cleanup`] operation, regardless of internal heuristics.
+/// Forcibly perform the [`collect`] operation, regardless of internal heuristics.
 #[cold]
 pub fn collect_force() {
     let _ = LocalThreadState::with_current(LocalThreadState::collect_force);
