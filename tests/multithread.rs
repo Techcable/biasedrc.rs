@@ -15,6 +15,8 @@ impl Drop for DropCounter<'_> {
 }
 
 /// Tests multiple threads, scoped so that it is necessary to add to the queue and merge reference counts.
+///
+/// This corresponds to [`BehaviorAfterMerge::ImmediateDestruction`].
 #[test]
 fn requires_merge() {
     let counter = AtomicU32::new(0);
@@ -32,6 +34,103 @@ fn requires_merge() {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         biasedrc::collect_force();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// Tests multiple threads,
+/// scoped so that it is necessary to add to the queue and merge reference counts.
+///
+/// This corresponds to [`BehaviorAfterMerge::StillShared`].
+#[test]
+fn requires_merge_then_still_shared() {
+    let drop_counter = AtomicU32::new(0);
+    let (sender, receiver) = crossbeam_channel::bounded(0);
+    let begin_collection = Barrier::new(2);
+    let end_collection = Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let sender = sender;
+            let biased = Brc::new(DropCounter(&drop_counter));
+            sender.send([Brc::clone(&biased), biased]).unwrap();
+            begin_collection.wait();
+            biasedrc::collect_force();
+            end_collection.wait();
+        });
+        scope.spawn(|| {
+            let receiver = receiver;
+            let [biased1, biased2] = receiver.recv().unwrap();
+            assert_eq!(Brc::shared_count(&biased1), 0);
+            drop(biased1); // will make the shared count negative, requiring queuing
+            assert_eq!(Brc::shared_count(&biased2), -1);
+            begin_collection.wait();
+            end_collection.wait();
+            assert_eq!(Brc::shared_count(&biased2), 1);
+            assert_eq!(drop_counter.load(Ordering::SeqCst), 0);
+            drop(biased2);
+            assert_eq!(drop_counter.load(Ordering::SeqCst), 1);
+        });
+    });
+}
+
+#[derive(Default, Copy, Clone, Debug)]
+enum BehaviorAfterMerge {
+    /// This is the default
+    #[default]
+    ImmediateDestruction,
+    StillShared,
+}
+
+#[test]
+fn requires_merge_after_thread_death() {
+    requires_merge_after_thread_death_with(BehaviorAfterMerge::ImmediateDestruction);
+}
+
+#[test]
+fn requires_merge_after_thread_death_then_still_shared() {
+    requires_merge_after_thread_death_with(BehaviorAfterMerge::StillShared);
+}
+
+/// Tests multiple threads,
+/// scoped so that it is necessary to add to the queue and merge reference counts
+/// after the thread has already died.
+///
+/// There are two cases: One where we have to execute the destructor immediately after merge
+/// ([`BehaviorAfterMerge::ImmediateDestruction`]
+/// and one where shared references are still live so we do the destruction later ([`BehaviorAfterMerge::StillShared`]).
+fn requires_merge_after_thread_death_with(mode: BehaviorAfterMerge) {
+    let counter = AtomicU32::new(0);
+    let (sender, receiver) = crossbeam_channel::bounded(0);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            let sender = sender;
+            let obj = Brc::new(DropCounter(&counter));
+            // send the biased reference to the other thread
+            sender.send(obj).unwrap();
+        });
+        scope.spawn(|| {
+            let receiver = receiver;
+            // take ownership the biased Brc that the first thread created
+            let biased = receiver.recv().unwrap();
+            let shared = match mode {
+                BehaviorAfterMerge::ImmediateDestruction => None,
+                BehaviorAfterMerge::StillShared => Some(Brc::clone(&biased)),
+            };
+            // wait until the first thread dies
+            first.join().expect("Failed to join first thread");
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
+            // this will drop the shared count to -1, necessitating a merge
+            drop(biased);
+            // the merge should have been performed immediately since the first thread has died
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                match mode {
+                    BehaviorAfterMerge::ImmediateDestruction => 1,
+                    BehaviorAfterMerge::StillShared => 0,
+                }
+            );
+            drop(shared);
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        });
     });
 }
 
