@@ -1,4 +1,6 @@
-use crate::runtime::threads::{LocalThreadAccessError, LocalThreadState, ShortThreadId};
+use crate::runtime::threads::{
+    LocalThreadAccessError, LocalThreadState, SharedThreadInfo, ShortThreadId,
+};
 use arbitrary_int::prelude::*;
 use core::marker::PhantomPinned;
 use core::sync::atomic::AtomicU32;
@@ -136,8 +138,8 @@ impl RawBrcHeader {
     /// This is a safe operation for the same reason that [`std::mem::forget`] is.
     #[inline]
     pub fn increment_strong(&self) {
-        if self.attempt_fast_increment().is_err() {
-            self.slow_increment();
+        if self.attempt_biased_increment().is_err() {
+            self.shared_increment();
         }
     }
 
@@ -242,7 +244,7 @@ impl RawBrcHeader {
     }
 
     #[inline]
-    fn attempt_fast_increment(&self) -> Result<(), FastIncrementFailure> {
+    fn attempt_biased_increment(&self) -> Result<(), FastIncrementFailure> {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         let incremented_counter = biased_word
             .biased_count
@@ -264,8 +266,13 @@ impl RawBrcHeader {
         }
     }
 
+    /// This function is extremely small (~40 bytes on aarch64).
+    ///
+    /// As such, we mark it `#[inline]` even though it is on the cold path.
+    /// This way it is eligible for inlining even without using LTO.
     #[cold]
-    fn slow_increment(&self) {
+    #[inline]
+    fn shared_increment(&self) {
         // safe to use a relaxed CAS here, as justified in Arc::clone
         let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
         if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {
@@ -292,17 +299,17 @@ impl RawBrcHeader {
     #[inline]
     pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) {
         // SAFETY: Caller guarantees drop function is valid and RC is owned
-        match unsafe { self.fast_decrement(drop) } {
+        match unsafe { self.decrement_biased(drop) } {
             Ok(()) => {} // nothing more to do
             Err(FastDecrementFailure) => {
                 // SAFETY: Caller guarantees drop function is valid and RC is owned
-                unsafe { self.slow_decrement_trampoline(drop) }
+                unsafe { self.decrement_shared(drop) }
             }
         }
     }
 
     #[inline]
-    unsafe fn fast_decrement<D: DropInfo>(&self, drop: D) -> Result<(), FastDecrementFailure> {
+    unsafe fn decrement_biased<D: DropInfo>(&self, drop: D) -> Result<(), FastDecrementFailure> {
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         let owner_id = biased_word.owner_id.ok_or(FastDecrementFailure)?;
         let this_id = match LocalThreadState::existing_short_id() {
@@ -338,7 +345,7 @@ impl RawBrcHeader {
             } else {
                 // SAFETY: We have already verified that we are the biased thread
                 unsafe {
-                    self.fast_decrement_slow::<D>(drop);
+                    self.decrement_biased_slow::<D>(drop);
                 }
                 Ok(())
             }
@@ -347,7 +354,7 @@ impl RawBrcHeader {
         }
     }
 
-    /// The slow-path for [`Self::fast_decrement`],
+    /// The slow-path for [`Self::decrement_biased`],
     /// still assuming this thread is the owner.
     ///
     /// We monomorphize this as it doesn't involve much code.
@@ -357,13 +364,13 @@ impl RawBrcHeader {
     /// and that it is still "biased".
     #[cold]
     #[inline(never)] // inlining this seems to harm performance
-    unsafe fn fast_decrement_slow<D: DropInfo>(&self, drop: D) {
+    unsafe fn decrement_biased_slow<D: DropInfo>(&self, drop: D) {
         let old_shared = SharedWord::from_raw(
             self.shared_word
                 .fetch_or(SharedWord::MERGED_BIT, Ordering::AcqRel),
         );
         debug_assert!(!old_shared.merged);
-        // only change is the addition of the merge bit
+        // the only change is the addition of the merge bit
         let new_shared = SharedWord {
             merged: true,
             ..old_shared
@@ -380,23 +387,14 @@ impl RawBrcHeader {
         }
     }
 
-    /// Trampoline to call into [`Self::slow_decrement`].
-    ///
-    /// Saves a couple of instructions in the fast path,
-    /// particularly when there is no pointer metadata,
-    /// the layout is constant, or no destructor is needed.
     #[cold]
     #[inline(never)]
-    unsafe fn slow_decrement_trampoline<D: DropInfo>(&self, drop: D) {
-        // SAFETY: All invariants are responsibility of the caller
-        unsafe { self.slow_decrement(drop.erase()) }
-    }
-
-    #[cold]
-    #[inline(never)]
-    unsafe fn slow_decrement(&self, drop: ErasedDropInfo) {
+    unsafe fn decrement_shared<D: DropInfo>(&self, drop: D) {
         let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
         let mut new: SharedWord;
+        // TODO: What if we split this into two CAS operations?
+        // This could allow us to move queuing into an even slower slow-path,
+        // triggered only when the shared_count is negative
         loop {
             new = SharedWord {
                 shared_count: old
@@ -420,27 +418,51 @@ impl RawBrcHeader {
         }
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
-            let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
-            let owner_id = biased_word
-                .owner_id
-                .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
-            // SAFETY: The refcnt guarantees the header will not be dropped,
-            // and the caller guarantees the drop information is valid
-            //
-            // We also know that this will be called at most once due to the successful CAS
-            unsafe {
-                threads::SharedThreadInfo::get_by_id(owner_id)
-                    .unwrap_or_else(|| undefined_behavior::owner_undefined_state())
-                    .queue_object(QueuedObject {
-                        header_ptr: NonNull::from(self),
-                        drop: drop.clone(),
-                    });
-            }
+            // SAFETY: We now have the exclusive right to queue the object
+            unsafe { self.decrement_shared_do_queue(drop) }
         } else if new.merged && new.shared_count.value() == 0 {
             // SAFETY: Valid to deallocate
             unsafe {
                 drop.dealloc(NonNull::from(self));
             }
+        }
+    }
+
+    /// The slow path for [`Self::decrement_shared`],
+    /// where an object needs to be added to the queue.
+    ///
+    /// # Size & Speed
+    /// Although this is the slowest of the slow paths, the function is monomorphized to avoid
+    /// the overhead of calling [`DropInfo::erase`] in the caller.
+    /// In practice, this function appears fairly small.
+    /// It is around 156 bytes on aarch64, which is similar to `decrement_shared` (148 bytes).
+    /// The function [`SharedThreadInfo::queue_object`] is over 300 bytes,
+    /// but is marked `#[inline(never)]` so does not bloat this function.
+    ///
+    /// # Safety
+    /// Should only be called by [`Self::decrement_shared`]
+    ///
+    /// Undefined behavior if called more than once.
+    /// Must have set the queued flag before running this function.
+    #[cold]
+    #[inline(never)]
+    unsafe fn decrement_shared_do_queue<D: DropInfo>(&self, drop: D) {
+        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+        let owner_id = biased_word
+            .owner_id
+            .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
+        let drop = drop.erase();
+        // SAFETY: The refcnt guarantees the header will not be dropped,
+        // and the caller guarantees the drop information is valid
+        //
+        // We also know that this will be called at most once due to the successful CAS
+        unsafe {
+            SharedThreadInfo::get_by_id(owner_id)
+                .unwrap_or_else(|| undefined_behavior::owner_undefined_state())
+                .queue_object(QueuedObject {
+                    header_ptr: NonNull::from(self),
+                    drop: drop.clone(),
+                });
         }
     }
 }

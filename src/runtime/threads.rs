@@ -164,6 +164,7 @@ impl SharedThreadInfo {
     /// # Panics
     /// This function is infallible, but may abort if internal corruption is discovered.
     #[cold]
+    #[inline(never)]
     pub unsafe fn queue_object(&self, object: QueuedObject) {
         nounwind::abort_unwind(|| {
             match self.queued_objects.upgrade() {
