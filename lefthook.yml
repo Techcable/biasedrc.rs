@@ -22,6 +22,10 @@ pre-commit:
     typos:
       tags: spellcheck
       run: uvx typos@1.38 --force-exclude --format=brief -- {staged_files}
+    cargo-sort:
+      tags: formatter
+      glob: "*.toml"
+      run: cargo sort --grouped --workspace --check . >/dev/null
 # takes one parameter - the file with the proposed commit message
 # access through lefthook with `{1}`
 #

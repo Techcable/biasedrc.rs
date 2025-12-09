@@ -8,29 +8,50 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Techcable/biasedrc.rs"
 keywords = ["biasedrc", "arc", "rc"]
 
+[features]
+# Use the nightly pointer metadata feature instead of the stable one
+#
+# Removing this feature could break some code,
+# as it means you will need to use the ptr_meta crate instead.
+nightly-ptr-meta = []
+# Use the nightly pointer coercison feature, to avoid needing the `unsize` crate
+#
+# Removing this feature could break some code,
+# but adding it never will.
+nightly-coerce = []
+# Enable serde serialization support
+serde = ["dep:serde"]
+
 [dependencies]
-boxcar = "0.2"
+
+# Concurrency
 atomic = "0.6"
-bytemuck = { version = "1", features = ["derive"] }
-thiserror = "2"
+boxcar = "0.2"
 crossbeam-queue = "0.3"
-arbitrary-int = "2"
-nounwind = { version = "0.1", features = ["std"], default-features = false }
-stable_deref_trait = "1.2"
-# Emulate the ptr_metadata unstable feature on stable rust
+
+# Polyfills for nightly features
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 unsize = "1.1"
+
+# Utilities
+arbitrary-int = "2"
+bytemuck = { version = "1", features = ["derive"] }
+nounwind = { version = "0.1", features = ["std"], default-features = false }
+thiserror = "2"
+
+# Third-party integration
+arc-swap = { version = "1.7", optional = true }
 archery = "1"
 serde = { package = "serde_core", version = "1", optional = true }
-arc-swap = { version = "1.7", optional = true }
+stable_deref_trait = "1.2"
 
 [dev-dependencies]
-triomphe = "0.1"
-rpds = "1.2"
 criterion = "0.8"
+crossbeam-channel = "0.5"
 imbl = "6.1"
 rand = { version = "0.9", features = ["small_rng"] }
-crossbeam-channel = "0.5"
+rpds = "1.2"
+triomphe = "0.1"
 
 [[bench]]
 name = "basic"
@@ -98,20 +119,6 @@ harness = false
 
 [profile.bench]
 debug = true
-
-[features]
-# Use the nightly pointer metadata feature instead of the stable one
-#
-# Removing this feature could break some code,
-# as it means you will need to use the ptr_meta crate instead.
-nightly-ptr-meta = []
-# Use the nightly pointer coercison feature, to avoid needing the `unsize` crate
-#
-# Removing this feature could break some code,
-# but adding it never will.
-nightly-coerce = []
-# Enable serde serialization support
-serde = ["dep:serde"]
 
 [lints.rust]
 missing-docs = "warn"

@@ -24,10 +24,12 @@ _check:
 format: && spellcheck
     cargo fmt --all
     taplo format
+    cargo sort --grouped --workspace .
 
 check-format: && spellcheck
     cargo fmt --check --all
     taplo format --check
+    cargo sort --grouped --workspace --check .
 
 spellcheck:
     @# use pinned version to avoid breaking build
