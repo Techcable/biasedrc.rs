@@ -121,7 +121,6 @@ harness = false
 debug = true
 
 [lints.rust]
-missing-docs = "deny"
 unsafe-op-in-unsafe-fn = "deny"
 
 [lints.rust.unexpected_cfgs]

@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rpds::HashTrieMapSync;
 use std::hint::black_box;

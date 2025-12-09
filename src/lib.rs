@@ -3,6 +3,7 @@
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
+#![deny(missing_docs)]
 
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;

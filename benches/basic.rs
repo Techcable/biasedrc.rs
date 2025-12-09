@@ -1,4 +1,4 @@
-#![allow(clippy::disallowed_types, missing_docs)]
+#![allow(clippy::disallowed_types)]
 use biasedrc::Brc;
 use std::rc::Rc;
 use std::sync::Arc;

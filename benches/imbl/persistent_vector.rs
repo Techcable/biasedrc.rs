@@ -1,9 +1,4 @@
-#![allow(
-    clippy::pedantic,
-    clippy::disallowed_types,
-    clippy::if_same_then_else,
-    missing_docs
-)]
+#![allow(clippy::pedantic, clippy::disallowed_types, clippy::if_same_then_else)]
 use archery::{ArcK, RcK, SharedPointerKind};
 use biasedrc::BrcK;
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};

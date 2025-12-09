@@ -2,8 +2,7 @@
     clippy::pedantic,
     clippy::disallowed_types,
     clippy::single_element_loop,
-    clippy::if_same_then_else,
-    missing_docs
+    clippy::if_same_then_else
 )]
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 use std::borrow::Borrow;

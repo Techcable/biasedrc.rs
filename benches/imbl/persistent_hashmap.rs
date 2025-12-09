@@ -1,9 +1,4 @@
-#![allow(
-    clippy::pedantic,
-    clippy::disallowed_types,
-    clippy::if_same_then_else,
-    missing_docs
-)]
+#![allow(clippy::pedantic, clippy::disallowed_types, clippy::if_same_then_else)]
 use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 use std::borrow::Borrow;
 use std::collections::HashMap as StdHashMap;

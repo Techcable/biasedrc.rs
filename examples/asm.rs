@@ -1,9 +1,5 @@
 //! Used with `cargo asm` to look at generated assembly.
-#![allow(
-    missing_docs,
-    clippy::disallowed_types,
-    clippy::no_mangle_with_rust_abi
-)]
+#![allow(clippy::disallowed_types, clippy::no_mangle_with_rust_abi)]
 
 use biasedrc::Brc;
 use std::fmt::Debug;
