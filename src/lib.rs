@@ -78,6 +78,16 @@ impl LayoutInfo {
 /// This means that [`Brc::get_mut`] and [`Brc::try_unwrap`] can fail spuriously
 /// even if the [`Arc`] is logically unique.
 /// It also means that [`Brc::into_inner`] cannot provide the same guarantees as [`Arc::into_inner`].
+///
+/// ## Deferred Destruction & Deferred Panics
+/// Destruction is not guaranteed to occur immediately when the last reference is [dropped](`drop`).
+/// It may be deferred until [`collect`] is called on another thread.
+///
+/// Since [`collect`] is called implicitly by [`Brc::clone`], [`Brc::clone`] and [`Brc::new`],
+/// any of these functions could panic while executing the deferred destructor of an unrelated object.
+/// If this is unacceptable,
+/// either use the [`Brc::drop_no_collect`] and [`Brc::clone_no_collect`] functions
+/// or the [`nounwind`] crate.
 #[repr(transparent)] // can be transmuted into a pointer
 pub struct Brc<T: ?Sized + SupportedPointee> {
     ptr: NonNull<T>,
@@ -85,6 +95,12 @@ pub struct Brc<T: ?Sized + SupportedPointee> {
 }
 impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
+    ///
+    /// # Panics
+    /// This may panic if [`collect`] does.
+    ///
+    /// The behavior on out of memory is determined by [`alloc::alloc::handle_alloc_error`],
+    /// which may involve a panic or an abort.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
         Self::new_with(|| value)
@@ -93,6 +109,9 @@ impl<T> Brc<T> {
     /// Construct a new [`Brc`], using a closure to initialize the specified value.
     ///
     /// This can potentially improve performance by allowing values to be constructed in place.
+    ///
+    /// # Panics
+    /// May panic in the same cases that [`Self::new`] does.
     #[inline]
     pub fn new_with(func: impl FnOnce() -> T) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
@@ -446,7 +465,13 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
 
     /// Increments the strong reference count on the [`Brc`] associated with the specified pointer.
     ///
-    /// Mirrors [`Brc::increment_strong_count`]
+    /// Similarly to [`Self::clone_no_collect`], this does not implicitly call [`collect`].
+    /// This is a low-level function which leaves that choice to the user.
+    ///
+    /// Mirrors [`Arc::increment_strong_count`]
+    ///
+    /// # Panics
+    /// See [`Self::clone_no_collect`] for details.
     ///
     /// # Safety
     /// The pointer must have been obtained through [`Brc::into_raw`] or [`Brc::as_ptr`],
@@ -455,12 +480,18 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub unsafe fn increment_strong_count(ptr: *const T) {
         // SAFETY: Caller guarantees the pointer is valid
         let this = ManuallyDrop::new(unsafe { Self::from_raw(ptr) });
-        core::mem::forget(Brc::clone(&*this));
+        core::mem::forget(Brc::clone_no_collect(&*this));
     }
 
     /// Decrements the strong reference count on the [`Brc`] associated with the specified pointer.
     ///
+    /// Similarly to [`Self::drop_no_collect`], this does not implicitly call [`collect`].
+    /// This is a low-level function which leaves that choice to the user.
+    ///
     /// Mirrors [`Arc::decrement_strong_count`].
+    ///
+    /// # Panics
+    /// See [`Self::drop_no_collect`] for details.
     ///
     /// # Safety
     /// The pointer must have been obtained through [`Brc::into_raw`] or [`Brc::as_ptr`],
@@ -472,7 +503,57 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     #[inline]
     pub unsafe fn decrement_strong_count(ptr: *const T) {
         // SAFETY: Caller guarantees pointer is active, corresponds to a real Brc
-        drop(unsafe { Brc::from_raw(ptr) });
+        Self::drop_no_collect(unsafe { Brc::from_raw(ptr) });
+    }
+
+    /// Clone this reference without invoking [`collect`].
+    ///
+    /// # Panics
+    /// Unlike [`Clone`], this function does not call [`collect`] and so will never panic.
+    /// However, it may abort if the reference count overflows or internal state appears corrupted.
+    #[inline]
+    pub fn clone_no_collect(this: &Self) -> Self {
+        this.header().increment_strong();
+        // SAFETY: Just successfully incremented the refcnt
+        unsafe { Brc::from_raw(this.ptr.as_ptr()) }
+    }
+
+    /// Drop this reference without invoking [`collect`].
+    ///
+    /// # Panics
+    /// Unlike [`drop`] which can panic due to [`collect`],
+    /// this function only panics if the underlying destructor does.
+    /// Similarly to [`drop`] the destructor may be deferred,
+    /// meaning a panicking destructor may not happen right away.
+    ///
+    /// This function may abort if internal state appears corrupted.
+    #[inline]
+    pub fn drop_no_collect(this: Self) {
+        let mut this = ManuallyDrop::new(this);
+        // SAFETY: Default Drop impl not executed due to ManuallyDrop
+        unsafe {
+            Self::drop_no_collect_in_place(&mut this);
+        }
+    }
+
+    /// Shared code for [`Self::drop_no_collect`] and [`drop`].
+    ///
+    /// # Safety
+    /// Must be semantically owned, just like when calling [`core::ptr::drop_in_place`].
+    #[inline]
+    unsafe fn drop_no_collect_in_place(this: &mut Self) {
+        let value: &T = this.deref();
+        let context = DropContext::<T> {
+            metadata: ptr_meta::metadata(value),
+            value_offset: this.layout().value_offset,
+            marker: PhantomData,
+        };
+        // SAFETY: We own a reference count and the context is valid
+        let result = unsafe { this.header().decrement_strong(context) };
+        if result.should_drop {
+            // SAFETY: We trust the drop function to return a valid result
+            unsafe { context.dealloc(NonNull::from(this.header())) }
+        }
     }
 
     #[inline]
@@ -504,32 +585,47 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
     }
 }
 impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
+    /// Drops a reference to the underlying object,
+    /// potentially freeing it if there are otherwise no references.
+    ///
+    /// This implicitly calls [`collect`] to help cleanup garbage from other threads.
+    /// Use [`Self::drop_no_collect`] to avoid this.
+    ///
+    /// Due to the nature of biased reference counting,
+    /// there are some cases where destruction may be deferred.
+    ///
+    /// # Panics
+    /// This may panic if the underlying destructor panics,
+    /// or if [`collect`] panics while executing a deferred destructor.
+    ///
+    /// This may abort if internal state appears corrupted.
     #[inline]
     fn drop(&mut self) {
         #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
-        let value: &T = self.deref();
-        let context = DropContext::<T> {
-            metadata: ptr_meta::metadata(value),
-            value_offset: self.layout().value_offset,
-            marker: PhantomData,
-        };
-        // SAFETY: We own a reference count and the context is valid
-        let result = unsafe { self.header().decrement_strong(context) };
-        if result.should_drop {
-            // SAFETY: We trust the drop function to return a valid result
-            unsafe { context.dealloc(NonNull::from(self.header())) }
+        // SAFETY: Drop function is executed at most once
+        // and Brc cannot be used once it completes.
+        unsafe {
+            Self::drop_no_collect_in_place(self);
         }
     }
 }
 impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
+    /// Create a new reference to the underlying object.
+    ///
+    /// This implicitly calls [`collect`] to help cleanup garbage from other threads.
+    /// Use [`Self::clone_no_collect`] to avoid this.
+    ///
+    /// # Panics
+    /// This function will panic only if [`collect`] panics.
+    ///
+    /// This function may abort if internal state appears corrupted,
+    /// or if a reference count overflows.
     #[inline]
     fn clone(&self) -> Self {
         #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
-        self.header().increment_strong();
-        // SAFETY: Just successfully incremented the refcnt
-        unsafe { Brc::from_raw(self.ptr.as_ptr()) }
+        Self::clone_no_collect(self)
     }
 }
 

@@ -736,16 +736,23 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
     }
 }
 
-/// Perform thread-local cleanup operations if deemed necessary.
+/// Perform thread-local cleanup operations if deemed necessary,
+/// potentially executing deferred destructors.
 ///
 /// This is necessary to unbias reference counts migrating across threads.
+/// Unlike traditional garbage collection, this should be needed rarely and run quickly.
 ///
 /// This function is implicitly called by [`crate::Brc::new`],
 /// [`crate::Brc::clone`], and [`crate::Brc::drop`],
 /// so only it needs to be invoked implicitly if a thread goes a long time without calling these functions.
 ///
+/// This function currently does nothing if [`std::thread::panicking`] returns true,
+/// but this behavior is not guaranteed and may change in the future.
+///
 /// # Panics
-/// Will never panic, but may abort if internal state is irreparably corrupted.
+/// Will panic only if one of the deferred destructors panics.
+///
+/// May abort if internal state is irreparably corrupted.
 #[inline]
 pub fn collect() {
     if LocalThreadState::currently_needs_collect() {
@@ -754,6 +761,9 @@ pub fn collect() {
 }
 
 /// Forcibly perform the [`collect`] operation, regardless of internal heuristics.
+///
+/// # Panics
+/// Panics in the same cases that [`collect`] does.
 #[cold]
 pub fn collect_force() {
     let _ = LocalThreadState::with_current(LocalThreadState::collect_force);
