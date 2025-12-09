@@ -423,6 +423,14 @@ pub struct LocalThreadStateFast {
     ///
     /// Used to tell if collection needs to be performed.
     ///
+    /// This requires another pointer indirection compared to using a flag stored inline.
+    /// This is done because it is easier to have TLS point to [`SharedThreadInfo`]
+    /// than to have [`SharedThreadInfo`] point to a TLS.
+    /// Based on some tests on my M1 Mac,
+    /// the performance benefit of eliminating this indirection is not statistically significant
+    /// (actually it sometimes appears negative).
+    /// This was surprising to me until I considered the impact of branch prediction.
+    ///
     /// If the thread is destroyed or uninitialized, this will be set to [`DUMMY_STATE_FLAG`].
     shared_state_flag: Cell<&'static Atomic<ThreadStateFlag>>,
 }
