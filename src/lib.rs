@@ -775,6 +775,11 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
         Self::clone_no_collect(self)
     }
 }
+/// A [`Brc`] is just a [`NonNull`] pointer, so `Option<Brc>` can be safely zero-initialized.
+///
+/// This requires `T: Sized` because not all pointer metadata is safe to zero-initialize.
+// SAFETY: We only wrap a NonNull (the allocator is stored in the header)
+unsafe impl<T, A: Allocator> bytemuck::ZeroableInOption for Brc<T, A> {}
 
 struct DropContext<T: ?Sized + SupportedPointee, A: Allocator> {
     metadata: <T as Pointee>::Metadata,
