@@ -2,12 +2,12 @@ use crate::runtime::threads::{
     LocalThreadAccessError, LocalThreadState, SharedThreadInfo, ShortThreadId,
 };
 use arbitrary_int::prelude::*;
+use core::ffi::c_void;
+use core::fmt::{Debug, Formatter};
 use core::marker::PhantomPinned;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
-use std::ffi::c_void;
-use std::fmt::{Debug, Formatter};
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use core::sync::atomic::Ordering;
 
 mod threads;
 
@@ -144,7 +144,7 @@ impl RawBrcHeader {
     /// In particular, a reference count overflow will trigger an abort.
     ///
     /// # Safety
-    /// This is a safe operation for the same reason that [`std::mem::forget`] is.
+    /// This is a safe operation for the same reason that [`core::mem::forget`] is.
     #[inline]
     pub fn increment_strong(&self) {
         if self.attempt_biased_increment().is_err() {
@@ -486,7 +486,7 @@ struct FastIncrementFailure;
 #[derive(Debug)]
 struct FastDecrementFailure;
 impl Debug for RawBrcHeader {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let RawBrcHeader {
             marker: _,
             biased_word,
@@ -718,16 +718,16 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
         }
     }
     match new_word.shared_count.value().cmp(&0) {
-        std::cmp::Ordering::Less => {
+        core::cmp::Ordering::Less => {
             // This can only happen if there are more drops then clones, which is UB
             // check for it anyway since we are in the cold-path
             undefined_behavior::negative_refcnt_merge()
         }
-        std::cmp::Ordering::Equal => {
+        core::cmp::Ordering::Equal => {
             // SAFETY: Caller promises the drop function is valid
             unsafe { object.drop.dealloc(object.header_ptr) }
         }
-        std::cmp::Ordering::Greater => {
+        core::cmp::Ordering::Greater => {
             // release ownership/unbias
             header
                 .biased_word

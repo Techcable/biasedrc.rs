@@ -132,7 +132,7 @@ check-cfg = ['cfg(biasedrc_no_implicit_collect)']
 cargo = { priority = -1, level = "warn" }
 pedantic = { level = "warn", priority = -1 }
 
-# misc restrictions
+# restrictions
 redundant_test_prefix = "warn" # name test_foo is redundant with #[test] attr
 
 # safety

@@ -1,14 +1,14 @@
 #![allow(clippy::disallowed_types, reason = "Need Arc to hold queue")]
 use crate::runtime::QueuedObject;
+use alloc::sync::{Arc, Weak};
 use arbitrary_int::prelude::*;
 use atomic::Atomic;
+use core::cell::Cell;
+use core::mem::ManuallyDrop;
+use core::num::{NonZeroU16, NonZeroUsize};
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering;
 use crossbeam_queue::SegQueue;
-use std::cell::Cell;
-use std::mem::ManuallyDrop;
-use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
 use std::thread::AccessError;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -241,7 +241,7 @@ impl LocalThreadState {
     /// This case cannot actually happen,
     /// as if the thread is live at the beginning of the closure,
     /// it will still be live by the end.
-    /// This is similar reasoning for why [`std::thread::LocalKey::with`] is safe.
+    /// This is similar reasoning for why [`core::thread::LocalKey::with`] is safe.
     ///
     /// It is well-defined to invoke this after the destructor is finished or in-progress.
     /// The state is updated appropriately at the beginning of the destructor,

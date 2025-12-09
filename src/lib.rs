@@ -1,9 +1,18 @@
 //! An implementation of [biased reference counting] for Rust.
 //!
+//! This crate requires the standard library due to use of [`std::thread_local!`].
+//!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
-#![deny(missing_docs)]
+#![deny(
+    missing_docs,
+    clippy::std_instead_of_core,
+    clippy::std_instead_of_alloc,
+    clippy::alloc_instead_of_core
+)]
+
+extern crate alloc;
 
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
@@ -12,23 +21,22 @@ use core::{marker::Unsize, ops::CoerceUnsized};
 #[cfg(not(feature = "nightly-ptr-meta"))]
 use ptr_meta_stable as ptr_meta;
 
+#[allow(unused_imports, clippy::disallowed_types, reason = "used for docs")]
+use alloc::sync::Arc;
+use core::alloc::Layout;
+use core::borrow::Borrow;
+use core::cmp::Ordering;
+use core::error::Error;
+use core::ffi::c_void;
+use core::fmt::{Debug, Display, Formatter};
+use core::hash::{Hash, Hasher};
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::ops::Deref;
+use core::ptr::NonNull;
 use pointee::{SupportedMetadata, SupportedPointeeInternal};
 use ptr_meta::Pointee;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
-use std::alloc::Layout;
-use std::borrow::Borrow;
-use std::cmp::Ordering;
-use std::error::Error;
-use std::ffi::c_void;
-use std::fmt::{Debug, Display, Formatter};
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
-use std::ptr::NonNull;
-#[allow(unused_imports, reason = "used in docs")]
-#[allow(clippy::disallowed_types, reason = "only used for docs")]
-use std::sync::Arc;
 
 #[cfg(feature = "arc-swap")]
 mod arc_swap;
@@ -46,7 +54,7 @@ struct LayoutInfo {
 }
 impl LayoutInfo {
     #[inline]
-    pub fn new(layout: Layout) -> Result<LayoutInfo, std::alloc::LayoutError> {
+    pub fn new(layout: Layout) -> Result<LayoutInfo, core::alloc::LayoutError> {
         let (full_layout, value_offset) = Layout::new::<RawBrcHeader>().extend(layout)?;
         Ok(LayoutInfo {
             full_layout,
@@ -175,7 +183,7 @@ impl<T> Brc<[T]> {
                 fn drop(&mut self) {
                     if core::mem::needs_drop::<T>() {
                         let initialized =
-                            std::ptr::slice_from_raw_parts_mut(self.dest, self.initialized_len);
+                            core::ptr::slice_from_raw_parts_mut(self.dest, self.initialized_len);
                         // SAFETY: Trust that `len` items have been initialized
                         unsafe {
                             core::ptr::drop_in_place(initialized);
@@ -201,7 +209,7 @@ impl<T> Brc<[T]> {
             // This is zero-cost if the iterator has no side effects
             let _ = iter.next();
             drop(iter); // this is permitted to panic
-            std::mem::forget(guard); // finished initialization
+            core::mem::forget(guard); // finished initialization
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
@@ -234,13 +242,13 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
             fn drop(&mut self) {
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
-                unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+                unsafe { alloc::alloc::dealloc(self.ptr, self.layout) }
             }
         }
         // SAFETY: Know the layout is non-empty, since it includes the header even if T is a ZST
-        let allocated = unsafe { std::alloc::alloc(layout.full_layout) };
+        let allocated = unsafe { alloc::alloc::alloc(layout.full_layout) };
         if allocated.is_null() {
-            std::alloc::handle_alloc_error(layout.full_layout);
+            alloc::alloc::handle_alloc_error(layout.full_layout);
         }
         let guard = CleanupGuard {
             ptr: allocated,
@@ -258,7 +266,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         let value_ptr_addr = unsafe { allocated.byte_offset(layout.value_offset).cast::<()>() };
         let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
         func(value_ptr);
-        std::mem::forget(guard);
+        core::mem::forget(guard);
         // SAFETY: Allocated pointer is valid and never null
         unsafe { Self::from_raw(value_ptr) }
     }
@@ -447,7 +455,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub unsafe fn increment_strong_count(ptr: *const T) {
         // SAFETY: Caller guarantees the pointer is valid
         let this = ManuallyDrop::new(unsafe { Self::from_raw(ptr) });
-        std::mem::forget(Brc::clone(&*this));
+        core::mem::forget(Brc::clone(&*this));
     }
 
     /// Decrements the strong reference count on the [`Brc`] associated with the specified pointer.
@@ -563,7 +571,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
         // SAFETY: Valid since T has not been dropped yet.
         // However, this violates stacked borrow. It works fine for tree borrows)
         let layout = unsafe { Layout::for_value(&*value) };
-        if std::mem::needs_drop::<T>() {
+        if core::mem::needs_drop::<T>() {
             // SAFETY: Caller guarantees this is not invoked until it is valid to drop
             unsafe { core::ptr::drop_in_place(value) }
         }
@@ -571,7 +579,7 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
         let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
         debug_assert_eq!(layout_info.value_offset, value_offset);
         // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { std::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
+        unsafe { alloc::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
     }
 }
 
@@ -636,12 +644,12 @@ mod pointee {
         #[inline]
         fn to_context(self) -> ErasedDestructorContext {
             // SAFETY: DynMetadata should just be a vtable pointer
-            unsafe { std::mem::transmute::<DynMetadata<Dyn>, ErasedDestructorContext>(self) }
+            unsafe { core::mem::transmute::<DynMetadata<Dyn>, ErasedDestructorContext>(self) }
         }
         #[inline]
         unsafe fn from_context(ctx: ErasedDestructorContext) -> Self {
             // SAFETY: DynMetadata should just be a vtable pointer, which we trust to be valid
-            unsafe { std::mem::transmute::<ErasedDestructorContext, DynMetadata<Dyn>>(ctx) }
+            unsafe { core::mem::transmute::<ErasedDestructorContext, DynMetadata<Dyn>>(ctx) }
         }
     }
 }
@@ -749,7 +757,7 @@ unsafe impl archery::SharedPointerKind for BrcK {
     }
 }
 impl Debug for BrcK {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BrcK").finish_non_exhaustive()
     }
 }
@@ -885,12 +893,12 @@ impl<T: ?Sized + SupportedPointee> AsRef<T> for Brc<T> {
     }
 }
 impl<T: ?Sized + SupportedPointee + Debug> Debug for Brc<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         Debug::fmt(self.deref(), f)
     }
 }
 impl<T: ?Sized + SupportedPointee + Display> Display for Brc<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         Display::fmt(self.deref(), f)
     }
 }
