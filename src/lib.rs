@@ -158,7 +158,7 @@ impl<T> Brc<[T]> {
     ///
     /// The iterator must either panic or yield precisely as many elements as its length.
     #[deny(clippy::multiple_unsafe_ops_per_block)]
-    pub unsafe fn from_iter_exact_trusted(
+    pub(crate) unsafe fn from_iter_exact_trusted(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
     ) -> Self {
