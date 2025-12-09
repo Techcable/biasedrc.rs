@@ -19,6 +19,10 @@ nightly-ptr-meta = []
 # Removing this feature could break some code,
 # but adding it never will.
 nightly-coerce = []
+# Use the nightly allocator API intead of the `allocator_api2` polyfill.
+#
+# Adding this feature can break code that assumes `allocator_api2` is being used.
+nightly-allocator = []
 # Enable serde serialization support
 serde = ["dep:serde"]
 
@@ -30,6 +34,7 @@ boxcar = "0.2"
 crossbeam-queue = "0.3"
 
 # Polyfills for nightly features
+allocator-api2 = "0.3"
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 unsize = "1.1"
 

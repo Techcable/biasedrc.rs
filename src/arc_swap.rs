@@ -25,6 +25,6 @@ unsafe impl<T> arc_swap::RefCnt for Brc<T> {
     #[inline]
     unsafe fn dec(ptr: *const Self::Base) {
         // SAFETY: Caller guarantees this is valid
-        unsafe { Brc::decrement_strong_count(ptr) }
+        unsafe { Brc::<T>::decrement_strong_count(ptr) }
     }
 }

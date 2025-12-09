@@ -5,6 +5,7 @@
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
+#![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
 #![deny(
     missing_docs,
     clippy::std_instead_of_core,
@@ -14,6 +15,10 @@
 
 extern crate alloc;
 
+#[cfg(feature = "nightly-allocator")]
+use alloc as allocator_api;
+#[cfg(not(feature = "nightly-allocator"))]
+use allocator_api2 as allocator_api;
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
 #[cfg(feature = "nightly-coerce")]
@@ -38,6 +43,8 @@ use pointee::{SupportedMetadata, SupportedPointeeInternal};
 use ptr_meta::Pointee;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
+use allocator_api::alloc::{Allocator, Global};
+
 #[cfg(feature = "arc-swap")]
 mod arc_swap;
 mod runtime;
@@ -48,18 +55,34 @@ use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 
 pub use crate::runtime::{BiasedCountError, ImpreciseRefCountError, collect, collect_force};
 
-struct LayoutInfo {
+/// Combines the reference counts with additional metadata.
+///
+/// This is `#[repr(C)]` because [`Brc::alloc_with_in`] initializes it field-by-field.
+#[repr(C)]
+struct BrcHeader<A: Allocator> {
+    rc: RawBrcHeader,
+    /// This is stored in the header because we cannot otherwise pass a monomorphized `A`
+    /// to an [`runtime::ErasedDropInfo`].
+    ///
+    /// The erased drop info is necessary to add the `Brc` to the merge queue.
+    alloc: ManuallyDrop<A>,
+}
+
+struct LayoutInfo<A: Allocator> {
     value_offset: isize,
     full_layout: Layout,
+    /// Our calculations depend on the layout of the allocator.
+    alloc_marker: PhantomData<fn(A)>,
 }
-impl LayoutInfo {
+impl<A: Allocator> LayoutInfo<A> {
     #[inline]
-    pub fn new(layout: Layout) -> Result<LayoutInfo, core::alloc::LayoutError> {
-        let (full_layout, value_offset) = Layout::new::<RawBrcHeader>().extend(layout)?;
+    pub fn new(layout: Layout) -> Result<Self, core::alloc::LayoutError> {
+        let (full_layout, value_offset) = Layout::new::<BrcHeader<A>>().extend(layout)?;
         Ok(LayoutInfo {
             full_layout,
             #[expect(clippy::cast_possible_wrap, reason = "offset fits in isize")]
             value_offset: value_offset as isize,
+            alloc_marker: PhantomData,
         })
     }
     /// Compute the offset (in bytes) from the value to get to the header.
@@ -79,6 +102,14 @@ impl LayoutInfo {
 /// even if the [`Arc`] is logically unique.
 /// It also means that [`Brc::into_inner`] cannot provide the same guarantees as [`Arc::into_inner`].
 ///
+/// ## Allocator
+/// The [`Brc`] is parameterized by an [`Allocator`] just like [`Arc`].
+/// However, the allocator is stored in the object header and so is shared across
+/// all references to a particular object.
+/// Although this is mainly due to design limitations,
+/// it obliviates the need for an `A: Clone` bound in some places that [`Arc`] requires that.
+/// However, it does add an `A: Clone` bound to [`Brc::into_raw_with_allocator`].
+///
 /// ## Deferred Destruction & Deferred Panics
 /// Destruction is not guaranteed to occur immediately when the last reference is [dropped](`drop`).
 /// It may be deferred until [`collect`] is called on another thread.
@@ -89,9 +120,10 @@ impl LayoutInfo {
 /// either use the [`Brc::drop_no_collect`] and [`Brc::clone_no_collect`] functions
 /// or the [`nounwind`] crate.
 #[repr(transparent)] // can be transmuted into a pointer
-pub struct Brc<T: ?Sized + SupportedPointee> {
+pub struct Brc<T: ?Sized + SupportedPointee, A: Allocator = Global> {
     ptr: NonNull<T>,
-    marker: PhantomData<T>,
+    value_marker: PhantomData<T>,
+    alloc_marker: PhantomData<A>,
 }
 impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
@@ -103,7 +135,7 @@ impl<T> Brc<T> {
     /// which may involve a panic or an abort.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
-        Self::new_with(|| value)
+        Self::new_with_in(|| value, Global)
     }
 
     /// Construct a new [`Brc`], using a closure to initialize the specified value.
@@ -116,7 +148,33 @@ impl<T> Brc<T> {
     pub fn new_with(func: impl FnOnce() -> T) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
         // or the initialization function panics
-        unsafe { Self::alloc_with(Layout::new::<T>(), (), |target| target.write(func())) }
+        unsafe {
+            Self::alloc_with_in(
+                Layout::new::<T>(),
+                (),
+                |target| target.write(func()),
+                Global,
+            )
+        }
+    }
+}
+impl<T, A: Allocator> Brc<T, A> {
+    /// Construct a new [`Brc`] with the specified value,
+    /// using a particular allocator.
+    #[inline]
+    pub fn new_in(value: T, alloc: A) -> Self {
+        Self::new_with_in(|| value, alloc)
+    }
+
+    /// Construct a new [`Brc`], using a closure to initialize the specified value,
+    /// along with using a particular allocator.
+    ///
+    /// This can potentially improve performance by allowing values to be constructed in place.
+    #[inline]
+    pub fn new_with_in(func: impl FnOnce() -> T, alloc: A) -> Self {
+        // SAFETY: Either we fully initialize the newly allocated memory,
+        // or the initialization function panics
+        unsafe { Self::alloc_with_in(Layout::new::<T>(), (), |target| target.write(func()), alloc) }
     }
 
     /// If the [`Brc`] is uniquely owned,
@@ -174,7 +232,7 @@ impl<T> Brc<T> {
         Self::try_unwrap(this).ok()
     }
 }
-impl<T> Brc<[T]> {
+impl<T, A: Allocator> Brc<[T], A> {
     /// Allocate a slice of memory rom a [`Layout`] and a,
     /// whose length is trusted to be exact.
     ///
@@ -186,9 +244,10 @@ impl<T> Brc<[T]> {
     ///
     /// The iterator must either panic or yield precisely as many elements as its length.
     #[deny(clippy::multiple_unsafe_ops_per_block)]
-    pub(crate) unsafe fn from_iter_exact_trusted(
+    pub(crate) unsafe fn from_iter_exact_trusted_in(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
+        alloc: A,
     ) -> Self {
         let len = iter.len();
         debug_assert_eq!(Ok(layout), Layout::array::<T>(len));
@@ -232,16 +291,29 @@ impl<T> Brc<[T]> {
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
-        unsafe { Brc::alloc_with(layout, len, do_init) }
+        unsafe { Brc::alloc_with_in(layout, len, do_init, alloc) }
     }
 }
-impl<T: ?Sized + SupportedPointee> Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
+    /// Return a reference to the underlying allocator.
+    ///
+    /// Mirrors [`Arc::allocator`].
+    #[inline]
+    pub fn allocator(this: &Self) -> &A {
+        &this.header().alloc
+    }
+
     /// Initialize the value using the specified callback.
     ///
     /// # Safety
     /// Callback must either fully initialize the memory or panic.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
-    unsafe fn alloc_with(layout: Layout, meta: T::Metadata, func: impl FnOnce(*mut T)) -> Brc<T> {
+    unsafe fn alloc_with_in(
+        layout: Layout,
+        meta: T::Metadata,
+        func: impl FnOnce(*mut T),
+        alloc: A,
+    ) -> Self {
         #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
         #[cold]
@@ -249,71 +321,58 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
         fn layout_overflow() -> ! {
             panic!("Layout of Brc would overflow an isize")
         }
-        let Ok(layout) = LayoutInfo::new(layout) else {
+        let Ok(layout) = LayoutInfo::<A>::new(layout) else {
             layout_overflow()
         };
-        struct CleanupGuard {
-            ptr: *mut u8,
+        struct CleanupGuard<A: Allocator> {
+            ptr: NonNull<u8>,
             layout: Layout,
+            alloc: Option<A>,
         }
-        impl Drop for CleanupGuard {
+        impl<A: Allocator> Drop for CleanupGuard<A> {
             #[inline]
             fn drop(&mut self) {
+                let alloc = self.alloc.take().unwrap();
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
-                unsafe { alloc::alloc::dealloc(self.ptr, self.layout) }
+                unsafe { alloc.deallocate(self.ptr, self.layout) }
             }
         }
-        // SAFETY: Know the layout is non-empty, since it includes the header even if T is a ZST
-        let allocated = unsafe { alloc::alloc::alloc(layout.full_layout) };
-        if allocated.is_null() {
+        let Ok(allocated) = alloc.allocate(layout.full_layout) else {
             alloc::alloc::handle_alloc_error(layout.full_layout);
-        }
-        let guard = CleanupGuard {
-            ptr: allocated,
-            layout: layout.full_layout,
         };
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "allocated with appropriate alignment"
-        )]
+        let mut guard = CleanupGuard {
+            ptr: allocated.cast(),
+            layout: layout.full_layout,
+            alloc: Some(alloc),
+        };
         // SAFETY: Memory is newly allocated so it is known to be valid
+        // The RawBrcHeader is pinned immediately after it is created
         unsafe {
             allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
         }
         // SAFETY: We trust the LayoutInfo to have the correct offset
-        let value_ptr_addr = unsafe { allocated.byte_offset(layout.value_offset).cast::<()>() };
+        let value_ptr_addr = unsafe {
+            allocated
+                .as_ptr()
+                .byte_offset(layout.value_offset)
+                .cast::<()>()
+        };
         let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
         func(value_ptr);
+        let alloc = guard.alloc.take().unwrap();
         core::mem::forget(guard);
-        // SAFETY: Allocated pointer is valid and never null
-        unsafe { Self::from_raw(value_ptr) }
-    }
-
-    /// Create a [`Brc`] from a raw pointer,
-    /// originating from [`Brc::into_raw`].
-    ///
-    /// Mirrors [`Arc::from_raw`].
-    ///
-    /// See also [`Brc::decrement_strong_count`], which directly mutates the reference count
-    /// without creating a owned value.
-    /// This is subject to roughly the same safety requirements.
-    ///
-    /// # Safety
-    /// This must correspond exactly to an owned reference count from [`Brc::into_raw`],
-    /// and is vulnerable to double-free if called multiple times on the same pointer.
-    ///
-    /// This is only valid for the result of [`Brc::into_raw`], not for any other piece of memory.
-    ///
-    /// # Panics
-    /// This function is infallible.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Brc<T> {
-        Brc {
-            // SAFETY: Cannot be null as it comes from `into_raw`
-            ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
-            marker: PhantomData,
+        // Now we have the allocator, we can initialize the rest of the header
+        // SAFETY: Know that the allocated memory starts with a BrcHeader
+        unsafe {
+            allocated
+                .byte_add(core::mem::offset_of!(BrcHeader<A>, alloc))
+                .cast::<A>()
+                .write(alloc);
         }
+        // SAFETY: Allocated pointer is valid and never null
+        // and the header is fully initialized
+        unsafe { Self::from_raw(value_ptr) }
     }
 
     /// Return the number of strong references to the object,
@@ -329,7 +388,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// and the true reference count cannot be determined.
     #[inline]
     pub fn strong_count(this: &Self) -> Result<usize, ImpreciseRefCountError> {
-        this.header().strong_count()
+        this.header().rc.strong_count()
     }
 
     /// Determine if this [`Brc`] is uniquely owned.
@@ -340,7 +399,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// See [`Self::strong_count`] for details.
     #[inline]
     pub fn is_unique(this: &Self) -> bool {
-        this.header().is_unique()
+        this.header().rc.is_unique()
     }
 
     /// Return the biased reference count,
@@ -349,7 +408,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// This method is intended only for testing.
     #[doc(hidden)]
     pub fn biased_count(this: &Self) -> Result<usize, BiasedCountError> {
-        this.header().biased_count()
+        this.header().rc.biased_count()
     }
 
     /// Return the shared reference count.
@@ -357,7 +416,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// This method is intended only for testing.
     #[doc(hidden)]
     pub fn shared_count(this: &Self) -> isize {
-        this.header().shared_count()
+        this.header().rc.shared_count()
     }
 
     /// Return the biased and shared reference counts.
@@ -416,21 +475,78 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub fn make_mut(this: &mut Self) -> &mut T
     where
         T: Clone,
+        A: Clone,
     {
         if Self::is_unique(this) {
             // SAFETY: Uniqueness makes this is safe
             unsafe { Self::get_mut_unchecked(this) }
         } else {
+            let alloc = Self::allocator(this).clone();
             let value = &**this;
-            *this = Self::new_with(|| T::clone(value));
+            *this = Self::new_with_in(|| T::clone(value), alloc);
             // SAFETY: We have ensured the reference is unique
             unsafe { Self::get_mut_unchecked(this) }
         }
     }
 
+    /// Create a [`Brc`] from a raw pointer,
+    /// originating from [`Brc::into_raw`].
+    ///
+    /// Mirrors [`Arc::from_raw`].
+    ///
+    /// See also [`Brc::decrement_strong_count`], which directly mutates the reference count
+    /// without creating a owned value.
+    /// This is subject to roughly the same safety requirements.
+    ///
+    /// Because the [`Brc`] stores the allocator in the header (as discussed in the type docs),
+    /// this function works fine for any allocator.
+    /// However, a [`Brc::from_raw_in`] function is added for completeness.
+    ///
+    /// # Safety
+    /// This must correspond exactly to an owned reference count from [`Brc::into_raw`],
+    /// and is vulnerable to double-free if called multiple times on the same pointer.
+    ///
+    /// This is only valid for the result of [`Brc::into_raw`], not for any other piece of memory.
+    ///
+    /// # Panics
+    /// This function is infallible.
+    #[inline]
+    pub unsafe fn from_raw(ptr: *const T) -> Self {
+        Brc {
+            // SAFETY: Cannot be null as it comes from `into_raw`
+            ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
+            value_marker: PhantomData,
+            alloc_marker: PhantomData,
+        }
+    }
+
+    /// Create a [`Brc`] from a raw pointer along with its allocator,
+    /// originating from [`Brc::into_raw_with_allocator`].
+    ///
+    /// Mirrors [`Arc::from_raw_in`].
+    ///
+    /// This function currently discards the allocator and calls [`Self::into_raw`].
+    /// For future-proofing and compatibility with [`Arc`],
+    /// it is required that the allocator is
+    /// equivalent to calling [`Self::allocator`] on the original reference.
+    ///
+    /// # Safety
+    /// Same requirements as [`Brc::from_raw`].
+    ///
+    /// # Panics
+    /// This function is infallible unless the allocator's drop function panics.
+    #[inline]
+    pub unsafe fn from_raw_in(ptr: *const T, alloc: A) -> Self {
+        drop(alloc);
+        // SAFETY: Caller guarantees validity
+        unsafe { Self::from_raw(ptr) }
+    }
+
     /// Consumes this [`Brc`], converting it into a raw pointer.
     ///
     /// Mirrors [`Arc::into_raw`].
+    /// Because the allocator is stored in the header,
+    /// this works well with any allocator.
     ///
     /// # Safety
     /// This is perfectly safe, but may leak memory.
@@ -442,6 +558,33 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub fn into_raw(this: Self) -> *const T {
         let value = ManuallyDrop::new(this);
         value.ptr.as_ptr().cast_const()
+    }
+
+    /// Consumes this [`Brc`], converting it into a raw pointer
+    /// along with a copy of the underlying allocator.
+    ///
+    /// Mirrors [`Arc::into_raw_with_allocator`],
+    /// but needs to add a `A: Clone` bound because the allocator is stored in the header
+    /// (see type-level docs for details)
+    /// If you just want to call [`Brc::from_raw_in`] later,
+    /// prefer [`Brc::into_raw`] and [`Brc::from_raw`] which avoid cloning the allocator.
+    /// Because the allocator is stored in the header,
+    /// these functions work for any allocator (unlike [`Arc`]).
+    ///
+    /// # Safety
+    /// This is perfectly safe, but may leak memory.
+    ///
+    /// # Panics
+    /// This function is infallible unless the allocator clone function panics.
+    #[allow(clippy::wrong_self_convention, reason = "could conflict with deref")]
+    #[inline]
+    pub fn into_raw_with_allocator(this: Self) -> (*const T, A)
+    where
+        A: Clone,
+    {
+        let allocator = Self::allocator(&this).clone();
+        let value = ManuallyDrop::new(this);
+        (value.ptr.as_ptr().cast_const(), allocator)
     }
 
     /// Convert this [`Brc`] into a raw pointer,
@@ -480,7 +623,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     pub unsafe fn increment_strong_count(ptr: *const T) {
         // SAFETY: Caller guarantees the pointer is valid
         let this = ManuallyDrop::new(unsafe { Self::from_raw(ptr) });
-        core::mem::forget(Brc::clone_no_collect(&*this));
+        core::mem::forget(Self::clone_no_collect(&*this));
     }
 
     /// Decrements the strong reference count on the [`Brc`] associated with the specified pointer.
@@ -513,7 +656,7 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     /// However, it may abort if the reference count overflows or internal state appears corrupted.
     #[inline]
     pub fn clone_no_collect(this: &Self) -> Self {
-        this.header().increment_strong();
+        this.header().rc.increment_strong();
         // SAFETY: Just successfully incremented the refcnt
         unsafe { Brc::from_raw(this.ptr.as_ptr()) }
     }
@@ -543,40 +686,44 @@ impl<T: ?Sized + SupportedPointee> Brc<T> {
     #[inline]
     unsafe fn drop_no_collect_in_place(this: &mut Self) {
         let value: &T = this.deref();
-        let context = DropContext::<T> {
+        let context = DropContext::<T, A> {
             metadata: ptr_meta::metadata(value),
             value_offset: this.layout().value_offset,
             marker: PhantomData,
         };
         // SAFETY: We own a reference count and the context is valid
-        let result = unsafe { this.header().decrement_strong(context) };
+        let result = unsafe { this.header().rc.decrement_strong(context) };
         if result.should_drop {
             // SAFETY: We trust the drop function to return a valid result
-            unsafe { context.dealloc(NonNull::from(this.header())) }
+            unsafe {
+                context.dealloc(NonNull::new_unchecked(
+                    (&raw const this.header().rc).cast_mut(),
+                ));
+            }
         }
     }
 
     #[inline]
-    fn layout(&self) -> LayoutInfo {
+    fn layout(&self) -> LayoutInfo<A> {
         let this_layout = Layout::for_value(self.deref());
         // SAFETY: Cannot overflow since the value has already been allocated
         unsafe { LayoutInfo::new(this_layout).unwrap_unchecked() }
     }
 
     #[inline]
-    fn header(&self) -> &RawBrcHeader {
+    fn header(&self) -> &BrcHeader<A> {
         let header_offset = self.layout().header_offset();
         // SAFETY: A Brc always has a valid header, which can then be dereferenced
         unsafe {
             self.ptr
                 .cast::<u8>()
                 .offset(header_offset)
-                .cast::<RawBrcHeader>()
+                .cast::<BrcHeader<A>>()
                 .as_ref()
         }
     }
 }
-impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Deref for Brc<T, A> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -584,7 +731,7 @@ impl<T: ?Sized + SupportedPointee> Deref for Brc<T> {
         unsafe { self.ptr.as_ref() }
     }
 }
-impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
     /// Drops a reference to the underlying object,
     /// potentially freeing it if there are otherwise no references.
     ///
@@ -610,7 +757,7 @@ impl<T: ?Sized + SupportedPointee> Drop for Brc<T> {
         }
     }
 }
-impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     /// Create a new reference to the underlying object.
     ///
     /// This implicitly calls [`collect`] to help cleanup garbage from other threads.
@@ -629,19 +776,19 @@ impl<T: ?Sized + SupportedPointee> Clone for Brc<T> {
     }
 }
 
-struct DropContext<T: ?Sized + SupportedPointee> {
+struct DropContext<T: ?Sized + SupportedPointee, A: Allocator> {
     metadata: <T as Pointee>::Metadata,
     value_offset: isize,
-    marker: PhantomData<fn(*mut T)>,
+    marker: PhantomData<fn(*mut T, A)>,
 }
-impl<T: ?Sized + SupportedPointee> Copy for DropContext<T> {}
-impl<T: ?Sized + SupportedPointee> Clone for DropContext<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Copy for DropContext<T, A> {}
+impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for DropContext<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> {
     #[inline]
     fn value_offset(&self) -> isize {
         self.value_offset
@@ -671,11 +818,24 @@ impl<T: ?Sized + SupportedPointee> DropInfo for DropContext<T> {
             // SAFETY: Caller guarantees this is not invoked until it is valid to drop
             unsafe { core::ptr::drop_in_place(value) }
         }
+        const {
+            assert!(!RawBrcHeader::NEEDS_DROP);
+        }
+        // Move the allocator out of the header
+        // SAFETY: Will never be used again after dealloc
+        let alloc: A = unsafe {
+            header_ptr
+                .as_ptr()
+                .cast::<BrcHeader<A>>()
+                .byte_add(core::mem::offset_of!(BrcHeader<A>, alloc))
+                .cast::<A>()
+                .read()
+        };
         // SAFETY: Know the layout will not overflow since already allocated
-        let layout_info = unsafe { LayoutInfo::new(layout).unwrap_unchecked() };
+        let layout_info = unsafe { LayoutInfo::<A>::new(layout).unwrap_unchecked() };
         debug_assert_eq!(layout_info.value_offset, value_offset);
         // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { alloc::alloc::dealloc(header_ptr.as_ptr().cast(), layout_info.full_layout) };
+        unsafe { alloc.deallocate(header_ptr.cast(), layout_info.full_layout) };
     }
 }
 
@@ -858,7 +1018,7 @@ impl Debug for BrcK {
     }
 }
 
-impl<T: ?Sized + SupportedPointee + Error> Error for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Error, A: Allocator> Error for Brc<T, A> {
     #[inline]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.deref().source()
@@ -877,9 +1037,9 @@ impl<T: ?Sized + SupportedPointee + Error> Error for Brc<T> {
     }
 }
 // SAFETY: A Cloned Brc just increments the RC, so memory location is the same
-unsafe impl<T: ?Sized + SupportedPointee> CloneStableDeref for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> CloneStableDeref for Brc<T, A> {}
 // SAFETY: A Brc is heap allocated so the memory never moves
-unsafe impl<T: ?Sized + SupportedPointee> StableDeref for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> StableDeref for Brc<T, A> {}
 impl<T> From<T> for Brc<T> {
     #[inline]
     fn from(value: T) -> Self {
@@ -900,29 +1060,34 @@ impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
         // SAFETY: Fully initializes the value by copying from the Box.
         // Can only fail if the allocation does
         unsafe {
-            Self::alloc_with(layout, meta, move |dest| {
-                let value = ManuallyDrop::new(value);
-                dest.cast::<u8>().copy_from_nonoverlapping(
-                    core::ptr::from_ref::<T>(&**value).cast::<u8>(),
-                    layout.size(),
-                );
-                drop(ManuallyDrop::into_inner(value));
-            })
+            Self::alloc_with_in(
+                layout,
+                meta,
+                move |dest| {
+                    let value = ManuallyDrop::new(value);
+                    dest.cast::<u8>().copy_from_nonoverlapping(
+                        core::ptr::from_ref::<T>(&**value).cast::<u8>(),
+                        layout.size(),
+                    );
+                    drop(ManuallyDrop::into_inner(value));
+                },
+                Global,
+            )
         }
     }
 }
 impl<T: Clone> From<&[T]> for Brc<[T]> {
     fn from(src: &[T]) -> Self {
         let layout = Layout::for_value(src);
-        // SAFETY: We trust the slice iterator + cloned() to have correct length
-        unsafe { Self::from_iter_exact_trusted(layout, src.iter().cloned()) }
+        // SAFETY: We trust the slice iterator + cloned() to have correct length or panic
+        unsafe { Self::from_iter_exact_trusted_in(layout, src.iter().cloned(), Global) }
     }
 }
 impl<T> From<Vec<T>> for Brc<[T]> {
     fn from(value: Vec<T>) -> Self {
         let layout = Layout::for_value(value.as_slice());
         // SAFETY: We trust the Vec iterator to have the correct length
-        unsafe { Self::from_iter_exact_trusted(layout, value.into_iter()) }
+        unsafe { Self::from_iter_exact_trusted_in(layout, value.into_iter(), Global) }
     }
 }
 impl From<&str> for Brc<str> {
@@ -969,66 +1134,78 @@ impl<T> FromIterator<T> for Brc<[T]> {
             let layout = Layout::array::<T>(len).expect("Layout overflow");
             // SAFETY: The AssertExactIter verifies the length is correct
             // The Layout is correct
-            unsafe { Self::from_iter_exact_trusted(layout, AssertExactIter { len, inner: iter }) }
+            unsafe {
+                Self::from_iter_exact_trusted_in(
+                    layout,
+                    AssertExactIter { len, inner: iter },
+                    Global,
+                )
+            }
         } else {
             // need to buffer
             iter.collect::<Vec<T>>().into()
         }
     }
 }
-impl<T: ?Sized + SupportedPointee> Borrow<T> for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> Borrow<T> for Brc<T, A> {
     #[inline]
     fn borrow(&self) -> &T {
         self.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee> AsRef<T> for Brc<T> {
+impl<T: ?Sized + SupportedPointee, A: Allocator> AsRef<T> for Brc<T, A> {
     #[inline]
     fn as_ref(&self) -> &T {
         self.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee + Debug> Debug for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Debug, A: Allocator> Debug for Brc<T, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         Debug::fmt(self.deref(), f)
     }
 }
-impl<T: ?Sized + SupportedPointee + Display> Display for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Display, A: Allocator> Display for Brc<T, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         Display::fmt(self.deref(), f)
     }
 }
-impl<T: ?Sized + SupportedPointee + PartialEq> PartialEq for Brc<T> {
+impl<T: ?Sized + SupportedPointee + PartialEq, A: Allocator> PartialEq for Brc<T, A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.deref() == other.deref()
     }
 }
-impl<T: ?Sized + SupportedPointee + PartialOrd> PartialOrd for Brc<T> {
+impl<T: ?Sized + SupportedPointee + PartialOrd, A: Allocator> PartialOrd for Brc<T, A> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.deref().partial_cmp(other.deref())
     }
 }
-impl<T: ?Sized + SupportedPointee + Ord> Ord for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Ord, A: Allocator> Ord for Brc<T, A> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.deref().cmp(other.deref())
     }
 }
-impl<T: ?Sized + SupportedPointee + Hash> Hash for Brc<T> {
+impl<T: ?Sized + SupportedPointee + Hash, A: Allocator> Hash for Brc<T, A> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.deref().hash(state);
     }
 }
-impl<T: ?Sized + SupportedPointee + Eq> Eq for Brc<T> {}
-impl<T: ?Sized + SupportedPointee> Unpin for Brc<T> {}
+impl<T: ?Sized + SupportedPointee + Eq, A: Allocator> Eq for Brc<T, A> {}
+impl<T: ?Sized + SupportedPointee, A: Allocator> Unpin for Brc<T, A> {}
 // SAFETY: We are thread safe if T is
 // We need to require T: Send to safely drop from other threads
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Sync for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Sync
+    for Brc<T, A>
+{
+}
 // SAFETY: We are thread safe if T is
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send> Send for Brc<T> {}
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Send
+    for Brc<T, A>
+{
+}
 
 #[cfg(feature = "nightly-coerce")]
 impl<T: ?Sized, U: ?Sized> CoerceUnsized<Brc<U>> for Brc<T>

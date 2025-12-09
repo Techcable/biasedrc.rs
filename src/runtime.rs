@@ -62,6 +62,11 @@ pub struct RawBrcHeader {
     marker: PhantomPinned,
 }
 impl RawBrcHeader {
+    /// We promise that a [`RawBrcHeader`] doesn't need to execute a drop function.
+    ///
+    /// This is true regardless of what [`std::mem::needs_drop`] claims.
+    pub const NEEDS_DROP: bool = false;
+
     /// Lazily initialize the [`threads::THIS_THREAD_STATE`] thread-local variable,
     /// returning the [`ShortThreadId`] if any.
     ///
