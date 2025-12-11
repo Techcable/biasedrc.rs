@@ -419,9 +419,33 @@ impl RawBrcHeader {
     unsafe fn decrement_shared<D: DropInfo>(&self, drop: D) -> StrongDecrementResult {
         let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
         let mut new: SharedWord;
-        // TODO: What if we split this into two CAS operations?
-        // This could allow us to move queuing into an even slower slow-path,
-        // triggered only when the shared_count is negative
+        // WARNING: It would be invalid to use `fetch_sub` on the shared counter,
+        // as subtraction would clobber the flags in the high-bit when the counter becomes negative.
+        //
+        // # Potential Optimization 1:
+        // The comments in `std::sync::Arc::drop` [1] claim that the counter subtraction here
+        // can use a `Release` ordering in the fast-path,
+        // as long as an `Acquire` fence is done in the cold-path before deallocation.
+        // I still use `AcqRel` to be conservative
+        // and because we care who wins the race to set the 'queued' flag.
+        //
+        // # Potential Optimization 2:
+        // It might be possible to split this into two CAS operations:
+        // One doing the subtraction in the fast-path
+        // and one another setting the queue bit in the cold path.
+        // The cold-path would only trigger if `new.shared_count <= 0`.
+        // I am unsure if this is profitable as it would require an additional CAS in the cold-path,
+        // and this function already does very little work besides the CAS.
+        // On my M1 macbook, it is just as fast as `Arc::drop` in the non-biased case
+        // and only takes up 152 bytes of machine code.
+        //
+        // The idea of using two CAS has issues with each operation seeing different states.
+        // Which counter should we consider when testing `new.merged && new.shared_count == 0`?
+        // The biased reference counting paper [2] has only a single CAS operation,
+        // so that is probably what we should stick with for now.
+        //
+        // [1]: https://github.com/rust-lang/rust/blob/1.91.0/library/alloc/src/sync.rs#L2639-L2674
+        // [2]: https://dl.acm.org/doi/10.1145/3243176.3243195
         loop {
             new = SharedWord {
                 shared_count: old
