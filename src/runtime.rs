@@ -141,22 +141,6 @@ impl RawBrcHeader {
         }
     }
 
-    /// Increment the object's strong count.
-    ///
-    /// # Panic
-    /// Guaranteed to never unwind,
-    /// although it may abort if a fatal issue is detected.
-    /// In particular, a reference count overflow will trigger an abort.
-    ///
-    /// # Safety
-    /// This is a safe operation for the same reason that [`core::mem::forget`] is.
-    #[inline]
-    pub fn increment_strong(&self) {
-        if self.attempt_biased_increment().is_err() {
-            self.shared_increment();
-        }
-    }
-
     /// Attempt to determine the number of strong references,
     /// returning an error if it cannot be precisely determined.
     #[inline]
@@ -280,13 +264,40 @@ impl RawBrcHeader {
         }
     }
 
+    /// Increment the object's strong count.
+    ///
+    /// # Panic
+    /// Guaranteed to never unwind,
+    /// although it may abort if a fatal issue is detected.
+    /// In particular, a reference count overflow will trigger an abort.
+    ///
+    /// # Safety
+    /// This is a safe operation for the same reason that [`core::mem::forget`] is.
+    #[inline]
+    pub fn increment_strong(&self) {
+        if self.attempt_biased_increment().is_err() {
+            self.increment_strong_shared();
+        }
+    }
+
+    /// Increment the object's shared strong count,
+    /// not affecting the biased count even if this is the biased thread.
+    ///
+    /// This is exposed mainly for testing purposes.
+    ///
+    /// # Performance
     /// This function is extremely small (~40 bytes on aarch64).
     ///
     /// As such, we mark it `#[inline]` even though it is on the cold path.
     /// This way it is eligible for inlining even without using LTO.
+    ///
+    /// # Safety
+    /// This is a safe operation for the same reason that [`core::mem::forget`] is.
+    ///
+    /// It is always safe to increment the shared count, regard
     #[cold]
     #[inline]
-    fn shared_increment(&self) {
+    pub fn increment_strong_shared(&self) {
         // safe to use a relaxed CAS here, as justified in Arc::clone
         let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
         if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {

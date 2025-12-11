@@ -679,6 +679,17 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         }
     }
 
+    /// Clone this reference count by incrementing the shared count.
+    ///
+    /// This function works the same regardless of the thread its called on.
+    /// Even if this is the biased thread, this still increments the shared count.
+    #[inline]
+    pub fn clone_shared(this: &Self) -> Self {
+        this.header().rc.increment_strong_shared();
+        // SAFETY: Just incremented the reference count
+        unsafe { Brc::from_raw(this.ptr.as_ptr()) }
+    }
+
     /// Shared code for [`Self::drop_no_collect`] and [`drop`].
     ///
     /// # Safety
