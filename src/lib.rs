@@ -759,7 +759,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
     /// This may abort if internal state appears corrupted.
     #[inline]
     fn drop(&mut self) {
-        #[cfg(not(biasedrc_no_implicit_collect))]
+        #[cfg(not(any(biasedrc_no_implicit_collect, biasedrc_no_implicit_collect_drop)))]
         collect();
         // SAFETY: Drop function is executed at most once
         // and Brc cannot be used once it completes.
@@ -781,7 +781,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     /// or if a reference count overflows.
     #[inline]
     fn clone(&self) -> Self {
-        #[cfg(not(biasedrc_no_implicit_collect))]
+        #[cfg(not(any(biasedrc_no_implicit_collect, biasedrc_no_implicit_collect_clone)))]
         collect();
         Self::clone_no_collect(self)
     }

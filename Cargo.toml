@@ -130,7 +130,11 @@ unsafe-op-in-unsafe-fn = "deny"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ['cfg(biasedrc_no_implicit_collect)']
+check-cfg = [
+    'cfg(biasedrc_no_implicit_collect)',
+    'cfg(biasedrc_no_implicit_collect_clone)',
+    'cfg(biasedrc_no_implicit_collect_drop)',
+]
 
 [lints.clippy]
 ## groups ##
