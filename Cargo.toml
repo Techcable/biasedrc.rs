@@ -25,6 +25,8 @@ nightly-coerce = []
 nightly-allocator = []
 # Enable serde serialization support
 serde = ["dep:serde"]
+# Implement archery::SharedPointerKind
+archery = ["dep:archery"]
 
 [dependencies]
 
@@ -46,7 +48,7 @@ thiserror = "2"
 
 # Third-party integration
 arc-swap = { version = "1.7", optional = true }
-archery = "1"
+archery = { version = "1", optional = true }
 serde = { package = "serde_core", version = "1", optional = true }
 stable_deref_trait = "1.2"
 
@@ -66,61 +68,73 @@ harness = false
 path = "benches/rpds/rpds_hash_trie_map.rs"
 name = "rpds_hash_trie_map"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_hash_trie_map_brc.rs"
 name = "rpds_hash_trie_map_brc"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_hash_trie_map_sync.rs"
 name = "rpds_hash_trie_map_sync"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_list.rs"
 name = "rpds_list"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_list_brc.rs"
 name = "rpds_list_brc"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_list_sync.rs"
 name = "rpds_list_sync"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_vector.rs"
 name = "rpds_vector"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_vector_brc.rs"
 name = "rpds_vector_brc"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 path = "benches/rpds/rpds_vector_sync.rs"
 name = "rpds_vector_sync"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 name = "persistent_hashmap"
 path = "benches/imbl/persistent_hashmap.rs"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 name = "persistent_ordmap"
 path = "benches/imbl/persistent_ordmap.rs"
 harness = false
+required-features = ["archery"]
 
 [[bench]]
 name = "persistent_vector"
 path = "benches/imbl/persistent_vector.rs"
 harness = false
+required-features = ["archery"]
 
 [profile.bench]
 debug = true
