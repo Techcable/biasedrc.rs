@@ -27,6 +27,7 @@ format: && spellcheck
     cargo sort --grouped --workspace .
 
 check-format: && spellcheck
+    cargo rdme --check
     cargo fmt --check --all
     taplo format --check
     cargo sort --grouped --workspace --check .

@@ -3,6 +3,8 @@
 
 An implementation of [biased reference counting] for Rust.
 
+This crate requires the standard library due to use of [`std::thread_local!`].
+
 [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 
 <!-- cargo-rdme end -->

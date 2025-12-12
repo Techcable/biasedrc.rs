@@ -11,6 +11,8 @@ pre-commit:
       tags: formatter
       # cargo assumed to be correct version, controlled via rustup
       run: cargo fmt --check
+    cargo-rdme:
+      run: cargo rdme --check
     taplo:
       tags: formatter
       glob: "*.toml"
