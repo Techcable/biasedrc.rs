@@ -3,6 +3,11 @@
 //! This crate requires the standard library due to use of [`std::thread_local!`].
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
+//!
+//! # Prior Art
+//! - [trc](https://github.com/EricLBuehler/trc) - Requires explicit choice of either `SharedTrc` or `Trc`,
+//!   avoiding need for runtime checks but preventing use as a drop-in replacement for `Arc`
+//! - [hybrid_rc](https://gitlab.com/cg909/rust-hybrid-rc) - Appears to require a similar choice as `trc` between shared and local references.
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
 #![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
