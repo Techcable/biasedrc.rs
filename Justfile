@@ -12,7 +12,7 @@ coverage: _check
 export MIRIFLAGS := "-Zmiri-tree-borrows -Zmiri-env-forward=RUST_BACKTRACE"
 
 miri *args: _check && check-format
-    cargo +nightly miri nextest run {{args}}
+    cargo +nightly miri nextest run --all-features {{args}}
 
 check: _check check-format
 
