@@ -321,10 +321,16 @@ impl RawBrcHeader {
     /// Undefined behavior if not correctly paired with [`Self::increment_strong`].
     /// The header must have been previously constructed using [`Self::init`],
     /// which allows skipping some initialization checks.
+    ///
+    /// The pointer to the object must be valid, as if passing `&self`.
+    /// We use raw pointers to comply with the requirements of Tree Borrows.
     #[inline]
-    pub unsafe fn decrement_strong<D: DropInfo>(&self, drop: D) -> StrongDecrementResult {
+    pub unsafe fn decrement_strong<D: DropInfo>(
+        this: *const Self,
+        drop: D,
+    ) -> StrongDecrementResult {
         // SAFETY: The RC is owned
-        match unsafe { self.decrement_biased() } {
+        match unsafe { (*this).decrement_biased() } {
             Ok(res) => {
                 // successfully executed biased decrement,
                 // return info on whether a drop is needed
@@ -332,7 +338,7 @@ impl RawBrcHeader {
             }
             Err(FastDecrementFailure) => {
                 // SAFETY: Caller guarantees drop function is valid and RC is owned
-                unsafe { self.decrement_shared(drop) }
+                unsafe { Self::decrement_shared(this, drop) }
             }
         }
     }
@@ -416,8 +422,10 @@ impl RawBrcHeader {
 
     #[cold]
     #[inline(never)]
-    unsafe fn decrement_shared<D: DropInfo>(&self, drop: D) -> StrongDecrementResult {
-        let mut old = SharedWord::from_raw(self.shared_word.load(Ordering::Relaxed));
+    unsafe fn decrement_shared<D: DropInfo>(this: *const Self, drop: D) -> StrongDecrementResult {
+        // SAFETY: Caller guarantees pointer is valid
+        let shared_word = unsafe { &(*this).shared_word };
+        let mut old = SharedWord::from_raw(shared_word.load(Ordering::Relaxed));
         let mut new: SharedWord;
         // WARNING: It would be invalid to use `fetch_sub` on the shared counter,
         // as subtraction would clobber the flags in the high-bit when the counter becomes negative.
@@ -457,7 +465,7 @@ impl RawBrcHeader {
             if new.shared_count.value() < 0 {
                 new.queued = true;
             }
-            match self.shared_word.compare_exchange_weak(
+            match shared_word.compare_exchange_weak(
                 old.to_raw(),
                 new.to_raw(),
                 Ordering::AcqRel,
@@ -471,7 +479,7 @@ impl RawBrcHeader {
         debug_assert!(!new.merged || new.shared_count.value() >= 0);
         if old.queued != new.queued {
             // SAFETY: We now have the exclusive right to queue the object
-            unsafe { self.decrement_shared_do_queue(drop) }
+            unsafe { Self::decrement_shared_do_queue(this, drop) }
             should_drop = false; // drop handled by queue
         } else {
             should_drop = new.merged && new.shared_count.value() == 0;
@@ -497,8 +505,10 @@ impl RawBrcHeader {
     /// Must have set the queued flag before running this function.
     #[cold]
     #[inline(never)]
-    unsafe fn decrement_shared_do_queue<D: DropInfo>(&self, drop: D) {
-        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+    unsafe fn decrement_shared_do_queue<D: DropInfo>(this: *const Self, drop: D) {
+        // SAFETY: Caller guarantees pointer is valid
+        let biased_word =
+            BiasedWord::from_raw(unsafe { &(*this).biased_word }.load(Ordering::Relaxed));
         let owner_id = biased_word
             .owner_id
             .unwrap_or_else(|| undefined_behavior::negative_refcnt_no_owner());
@@ -511,7 +521,7 @@ impl RawBrcHeader {
             SharedThreadInfo::get_by_id(owner_id)
                 .unwrap_or_else(|| undefined_behavior::owner_undefined_state())
                 .queue_object(QueuedObject {
-                    header_ptr: NonNull::from(self),
+                    header_ptr: NonNull::new_unchecked(this.cast_mut()),
                     drop: drop.clone(),
                 });
         }

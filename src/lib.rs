@@ -710,14 +710,15 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             value_offset: this.layout().value_offset,
             marker: PhantomData,
         };
+        // SAFETY: Pointer is spatially valid
+        let header_ptr = unsafe { Self::header_ptr_for(this.ptr, this.layout()).as_ptr() };
         // SAFETY: We own a reference count and the context is valid
-        let result = unsafe { this.header().rc.decrement_strong(context) };
+        let result =
+            unsafe { RawBrcHeader::decrement_strong(&raw const (*header_ptr).rc, context) };
         if result.should_drop {
             // SAFETY: We trust the drop function to return a valid result
             unsafe {
-                context.dealloc(NonNull::new_unchecked(
-                    (&raw const this.header().rc).cast_mut(),
-                ));
+                context.dealloc(NonNull::new_unchecked(&raw mut (*header_ptr).rc));
             }
         }
     }
@@ -730,16 +731,21 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     }
 
     #[inline]
-    fn header(&self) -> &BrcHeader<A> {
-        let header_offset = self.layout().header_offset();
-        // SAFETY: A Brc always has a valid header, which can then be dereferenced
+    unsafe fn header_ptr_for(ptr: NonNull<T>, layout: LayoutInfo<A>) -> NonNull<BrcHeader<A>> {
+        let header_offset = layout.header_offset();
+        // SAFETY: Caller guarantees pointer is spatially valid
         unsafe {
-            self.ptr
-                .cast::<u8>()
+            ptr.cast::<u8>()
                 .offset(header_offset)
                 .cast::<BrcHeader<A>>()
-                .as_ref()
         }
+    }
+
+    #[inline]
+    fn header(&self) -> &BrcHeader<A> {
+        let layout = self.layout();
+        // SAFETY: The header pointer is valid
+        unsafe { Self::header_ptr_for(self.ptr, layout).as_ref() }
     }
 }
 impl<T: ?Sized + SupportedPointee, A: Allocator> Deref for Brc<T, A> {
