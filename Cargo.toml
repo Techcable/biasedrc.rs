@@ -48,6 +48,7 @@ unsize = "1.1"
 # Utilities
 arbitrary-int = "2"
 bytemuck = { version = "1", features = ["derive"] }
+cfg-if = "1"
 nounwind = { version = "0.1", features = ["std"], default-features = false }
 thiserror = "2"
 

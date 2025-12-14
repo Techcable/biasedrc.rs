@@ -2,11 +2,13 @@ use crate::runtime::threads::{
     LocalThreadAccessError, LocalThreadState, SharedThreadInfo, ShortThreadId,
 };
 use arbitrary_int::prelude::*;
+use cfg_if::cfg_if;
 use core::ffi::c_void;
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomPinned;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 
 mod threads;
@@ -57,8 +59,8 @@ pub struct StrongDecrementResult {
 /// [`Brc`]: crate::Brc
 #[repr(C)]
 pub struct RawBrcHeader {
+    shared_word: AtomicUsize,
     biased_word: AtomicU32,
-    shared_word: AtomicU32,
     marker: PhantomPinned,
 }
 impl RawBrcHeader {
@@ -108,7 +110,7 @@ impl RawBrcHeader {
         };
         match this_id {
             None => RawBrcHeader {
-                shared_word: AtomicU32::new(
+                shared_word: AtomicUsize::new(
                     SharedWord {
                         shared_count: SharedCount::new(1),
                         // mark as merged
@@ -128,7 +130,7 @@ impl RawBrcHeader {
                     }
                     .to_raw(),
                 ),
-                shared_word: AtomicU32::new(
+                shared_word: AtomicUsize::new(
                     SharedWord {
                         queued: false,
                         merged: false,
@@ -169,22 +171,22 @@ impl RawBrcHeader {
         } else if biased_word.owner_id == this_thread_id {
             const {
                 assert!(
-                    BiasedCount::BITS + 1 < u32::BITS as usize,
-                    "biased count should be at least one bit smaller than u32"
+                    BiasedCount::BITS + 1 < usize::BITS as usize,
+                    "biased count should be at least one bit smaller than usize"
                 );
                 assert!(
-                    SharedCount::BITS + 1 < u32::BITS as usize,
-                    "biased count should be at least one bit smaller than u32"
+                    SharedCount::BITS + 1 < usize::BITS as usize,
+                    "biased count should be at least one bit smaller than usize"
                 );
             }
-            let biased_count = u32::from(biased_word.biased_count);
+            let biased_count = biased_word.biased_count.value() as usize;
             let shared_count = shared_word.shared_count.value();
-            // Since biased_count is 20-bits and shared_count is i30,
-            // the result should never overflow a u32.
+            // Since biased_count is 20-bits and shared_count is i30/i60,
+            // the result should never overflow a usize.
             // We just statically verified this above.
             //
             // The merged count cannot underflow, for reasons described above
-            let sum_count: u32 = {
+            let sum_count: usize = {
                 if cfg!(debug_assertions) {
                     biased_count
                         .checked_add_signed(shared_count)
@@ -193,7 +195,7 @@ impl RawBrcHeader {
                     biased_count.wrapping_add_signed(shared_count)
                 }
             };
-            Ok(sum_count as usize)
+            Ok(sum_count)
         } else {
             // We are not the owning thread, and the RCs have not been merged,
             // so we cannot know the true value of the reference counting.
@@ -238,7 +240,7 @@ impl RawBrcHeader {
     pub fn shared_count(&self) -> isize {
         SharedWord::from_raw(self.shared_word.load(Ordering::Acquire))
             .shared_count
-            .value() as isize
+            .value()
     }
 
     #[inline]
@@ -664,7 +666,64 @@ impl BiasedWord {
     }
 }
 
-type SharedCount = i30;
+cfg_if! {
+    if #[cfg(target_pointer_width = "32")] {
+        type SharedCountInner = i30;
+    } else if #[cfg(target_pointer_width = "64")] {
+        type SharedCountInner = i62;
+    } else {
+        // refusing to support 16-bit targets is mainly for simplicity,
+        // but also because then SharedCount::BITS < BiasedCount::BITS
+        compile_error!("unsupported pointer width");
+    }
+}
+/// Wrapper around [`SharedCountInner`] so that it uses `usize` instead of u32/u64
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SharedCount(SharedCountInner);
+impl SharedCount {
+    pub const BITS: usize = {
+        assert!(SharedCountInner::BITS <= usize::BITS as usize);
+        SharedCountInner::BITS
+    };
+    pub const MAX: Self = Self(SharedCountInner::MAX);
+    /// Create a new [`SharedCount`] without checking it fits.
+    ///
+    /// # Safety
+    /// Same requirements as [`SharedCountInner::new_unchecked`]
+    #[inline]
+    pub unsafe fn new_unchecked(val: isize) -> Self {
+        // SAFETY: Guaranteed by caller
+        unsafe { Self(SharedCountInner::new_unchecked(val as _)) }
+    }
+    /// Create a new [`SharedCount`], panicking if it doesn't fit.
+    #[inline]
+    pub const fn new(val: isize) -> Self {
+        Self(SharedCountInner::new(val as _))
+    }
+    #[inline]
+    #[expect(clippy::cast_possible_truncation, reason = "known to fit in isize")]
+    pub const fn value(self) -> isize {
+        self.0.value() as isize
+    }
+    #[inline]
+    #[expect(clippy::cast_possible_truncation, reason = "known to fit in usize")]
+    pub const fn to_bits(self) -> usize {
+        self.0.to_bits() as usize
+    }
+    #[inline]
+    pub fn masked_new(value: usize) -> Self {
+        Self(SharedCountInner::masked_new(value as u64))
+    }
+    #[inline]
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.0.checked_sub(other.0).map(Self)
+    }
+    #[inline]
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 struct SharedWord {
@@ -681,9 +740,9 @@ impl SharedWord {
     ///
     /// This is not necessarily equal to `size_of::<Self>() * 8`,
     /// because that is the unpacked size,
-    const BITS: usize = 32;
-    const MERGED_BIT: u32 = 1 << SharedCount::BITS;
-    const QUEUED_BIT: u32 = 1 << (SharedCount::BITS + 1);
+    const BITS: usize = SharedCount::BITS + 2;
+    const MERGED_BIT: usize = 1 << SharedCount::BITS;
+    const QUEUED_BIT: usize = 1 << (SharedCount::BITS + 1);
     /// The threshold past which a reference count should be considered to have overflown.
     ///
     /// This is checked against the result of calling [`fetch_add`] to check for overflow.
@@ -692,21 +751,21 @@ impl SharedWord {
     /// overflowing and then the thread going to sleep before the panic can occur.
     /// If enough threads end up incrementing the counter, then go to sleep,
     /// the counter could silently wrap around and the final thread would not notice the overflow.
-    /// However, for a 30-bit counter,
+    /// Even for a 30-bit counter,
     /// it would take over 100 million threads to reach this threshold.
     /// This is safe enough we don't have to worry about it.
     const OVERFLOW_THRESHOLD: SharedCount = SharedCount::new(SharedCount::MAX.value() / 2);
     #[inline]
-    fn to_raw(self) -> u32 {
+    fn to_raw(self) -> usize {
         const {
-            assert!(SharedCount::BITS + 2 == Self::BITS);
+            assert!(usize::BITS as usize == Self::BITS);
         }
         self.shared_count.to_bits()
-            | ((self.merged as u32) << SharedCount::BITS)
-            | ((self.queued as u32) << (SharedCount::BITS + 1))
+            | ((self.merged as usize) << SharedCount::BITS)
+            | ((self.queued as usize) << (SharedCount::BITS + 1))
     }
     #[inline]
-    fn from_raw(raw: u32) -> Self {
+    fn from_raw(raw: usize) -> Self {
         SharedWord {
             shared_count: SharedCount::masked_new(raw),
             merged: (raw & Self::MERGED_BIT) != 0,
@@ -750,7 +809,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             #[expect(clippy::cast_possible_wrap, reason = "checked above")]
             // SAFETY: We just checked above that a BiasedCount fits in a SharedCount
             unsafe {
-                biased_count = SharedCount::new_unchecked(biased.biased_count.value() as i32);
+                biased_count = SharedCount::new_unchecked(biased.biased_count.value() as isize);
             }
         }
         new_word = SharedWord {
