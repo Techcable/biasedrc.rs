@@ -10,6 +10,7 @@
 //! - [hybrid_rc](https://gitlab.com/cg909/rust-hybrid-rc) - Appears to require a similar choice as `trc` between shared and local references.
 #![cfg_attr(feature = "nightly-ptr-meta", feature(ptr_metadata))]
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
+#![cfg_attr(feature = "nightly-ptr-layout", feature(layout_for_ptr))]
 #![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
 #![deny(
     missing_docs,
@@ -35,15 +36,17 @@ use ptr_meta_stable as ptr_meta;
 use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::borrow::Borrow;
-use core::cmp::Ordering;
+use core::cmp;
 use core::error::Error;
 use core::fmt::{Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+use core::num::NonZeroUsize;
 use core::ops::Deref;
 use core::ptr::NonNull;
-use pointee::{SupportedMetadata, SupportedPointeeInternal};
+use core::sync::atomic::{AtomicU32, Ordering};
+use pointee::{SupportedMetadata, SupportedPointeeInternal, SupportedWeakPointeeInternal};
 use ptr_meta::Pointee;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
@@ -63,17 +66,77 @@ use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 pub use self::archery::BrcK;
 pub use crate::runtime::{BiasedCountError, ImpreciseRefCountError, collect, collect_force};
 
+const WEAK_LOCKED_COUNT: u32 = u32::MAX;
+/// If the weak reference passes this point,
+/// it should be considered to have overflown.
+const WEAK_OVERFLOW_THRESHOLD: u32 = u32::MAX / 2;
+
 /// Combines the reference counts with additional metadata.
 ///
 /// This is `#[repr(C)]` because [`Brc::alloc_with_in`] initializes it field-by-field.
 #[repr(C)]
 struct BrcHeader<A: Allocator> {
     rc: RawBrcHeader,
+    /// The weak reference count.
+    ///
+    /// May be [`WEAK_LOCKED_COUNT`] to indicate that it is "locked",
+    /// which is necessary to implement [`Brc::get_mut`] and [`Brc::make_mut`].
+    weak_count: AtomicU32,
     /// This is stored in the header because we cannot otherwise pass a monomorphized `A`
     /// to an [`runtime::ErasedDropInfo`].
     ///
     /// The erased drop info is necessary to add the `Brc` to the merge queue.
     alloc: ManuallyDrop<A>,
+}
+
+impl<A: Allocator> BrcHeader<A> {
+    /// Drop a weak reference associated with the header.
+    ///
+    /// Requires passing layout information,
+    /// as by now the underlying value `T` may have been destroyed
+    /// and the [`Layout::for_value_raw`] method is unstable.
+    #[inline]
+    unsafe fn drop_weak(header_ptr: *mut Self, layout_info: LayoutInfo<A>) {
+        // SAFETY: Caller guarantees header pointer is valid
+        let weak_count = unsafe { &(*header_ptr).weak_count };
+        // The reasoning in Arc::drop/Weak::drop justifies why we can weaken this to Release
+        // with an acquire fence afterward.
+        // The reasoning in Weak::drop explains why we don't need to check if we are locked
+        if weak_count.fetch_sub(1, Ordering::Acquire) == 1 {
+            // this is not moved into the cold path because
+            // it may be possible to fold into the load/store
+            atomic::fence(Ordering::Acquire);
+            // SAFETY: We just verified we are the last reference,
+            // caller guarantees the other requirements
+            unsafe { Self::drop_weak_slow(header_ptr, layout_info.full_layout) }
+        }
+    }
+
+    #[cold]
+    unsafe fn drop_weak_slow(header_ptr: *mut Self, full_layout: Layout) {
+        // SAFETY: Will not use the allocator after deallocation
+        let alloc = unsafe { Self::take_allocator(header_ptr) };
+        // SAFETY: Caller guarantees it is okay to
+        unsafe {
+            alloc.deallocate(NonNull::new_unchecked(header_ptr.cast::<u8>()), full_layout);
+        }
+    }
+
+    /// Consume ownership of the allocator.
+    ///
+    /// # Safety
+    /// Undefined behavior if the allocator is ever used again,
+    /// just like with [`ManuallyDrop::take`].
+    #[inline]
+    unsafe fn take_allocator(header_ptr: *const Self) -> A {
+        // SAFETY: Caller guarantees allocator will not be used again
+        unsafe {
+            header_ptr
+                .byte_add(core::mem::offset_of!(Self, alloc))
+                .cast::<A>()
+                .read()
+        }
+    }
 }
 
 struct LayoutInfo<A: Allocator> {
@@ -82,10 +145,22 @@ struct LayoutInfo<A: Allocator> {
     /// Our calculations depend on the layout of the allocator.
     alloc_marker: PhantomData<fn(A)>,
 }
+impl<A: Allocator> Copy for LayoutInfo<A> {}
+impl<A: Allocator> Clone for LayoutInfo<A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 impl<A: Allocator> LayoutInfo<A> {
+    /// The minimum alignment for the value.
+    ///
+    /// Necessary so that [`Weak`] can have a reserved value.
+    pub const MIN_VALUE_ALIGNMENT: usize = 2;
     #[inline]
     pub fn new(layout: Layout) -> Result<Self, core::alloc::LayoutError> {
-        let (full_layout, value_offset) = Layout::new::<BrcHeader<A>>().extend(layout)?;
+        let (full_layout, value_offset) =
+            Layout::new::<BrcHeader<A>>().extend(layout.align_to(Self::MIN_VALUE_ALIGNMENT)?)?;
         Ok(LayoutInfo {
             full_layout,
             #[expect(clippy::cast_possible_wrap, reason = "offset fits in isize")]
@@ -354,10 +429,22 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             layout: layout.full_layout,
             alloc: Some(alloc),
         };
+        const {
+            assert!(core::mem::offset_of!(BrcHeader<A>, rc) == 0);
+        }
         // SAFETY: Memory is newly allocated so it is known to be valid
         // The RawBrcHeader is pinned immediately after it is created
+        // we just verified above that the field offset is zero
         unsafe {
             allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
+        }
+        // SAFETY: Newly allocated memory is valid
+        unsafe {
+            allocated
+                .byte_add(core::mem::offset_of!(BrcHeader<A>, weak_count))
+                .cast::<AtomicU32>()
+                // there is a single weak reference shared among all strong references
+                .write(AtomicU32::new(1));
         }
         // SAFETY: We trust the LayoutInfo to have the correct offset
         let value_ptr_addr = unsafe {
@@ -401,13 +488,33 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
 
     /// Determine if this [`Brc`] is uniquely owned.
     ///
+    /// Mirrors [`std::sync::Arc::is_unique`].
+    ///
     /// Due to the nature of biased reference counting,
     /// this may have false-negatives when called on a non-biased thread.
     /// However, it will never have false positives.
     /// See [`Self::strong_count`] for details.
     #[inline]
     pub fn is_unique(this: &Self) -> bool {
-        this.header().rc.is_unique()
+        if this.header().rc.is_definitely_not_unique() {
+            // return false quickly if we are definitely not the biased thread
+            return false;
+        }
+        // if there is only one weak count, then we may be unique
+        // We still need to lock the reference count while we are checking.
+        if this
+            .header()
+            .weak_count
+            .compare_exchange(1, WEAK_LOCKED_COUNT, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let actually_unique = this.header().rc.is_unique();
+            // now release the lock on the weak reference count
+            this.header().weak_count.store(1, Ordering::Release);
+            actually_unique
+        } else {
+            false // multiple weak references
+        }
     }
 
     /// Return the biased reference count,
@@ -485,6 +592,8 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         T: Clone,
         A: Clone,
     {
+        // TODO: Implement the optimization that std::sync::Arc::make_mut does?
+        // It allows this method to be slightly better than `is_unique`
         if Self::is_unique(this) {
             // SAFETY: Uniqueness makes this is safe
             unsafe { Self::get_mut_unchecked(this) }
@@ -494,6 +603,45 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             *this = Self::new_with_in(|| T::clone(value), alloc);
             // SAFETY: We have ensured the reference is unique
             unsafe { Self::get_mut_unchecked(this) }
+        }
+    }
+
+    /// Downgrade into a new weak reference.
+    ///
+    /// Mirrors [`Arc::downgrade`].
+    #[must_use]
+    pub fn downgrade(this: &Self) -> Weak<T, A>
+    where
+        T: SupportedWeakPointee,
+    {
+        let mut weak_count = this.header().weak_count.load(Ordering::Relaxed);
+        loop {
+            // spin if the weak count is locked (Arc::downgrade does this too)
+            // the lock should only be held very briefly
+            if weak_count == WEAK_LOCKED_COUNT {
+                core::hint::spin_loop();
+                weak_count = this.header().weak_count.load(Ordering::Relaxed);
+                continue;
+            }
+            if weak_count > WEAK_OVERFLOW_THRESHOLD {
+                runtime::fatal_errors::weak_refcnt_overflow();
+            }
+            match this.header().weak_count.compare_exchange_weak(
+                weak_count,
+                weak_count + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // SAFETY: Just incremented the weak reference count
+                    unsafe {
+                        return Weak::from_raw(Self::as_ptr(this));
+                    }
+                }
+                Err(new_count) => {
+                    weak_count = new_count;
+                }
+            }
         }
     }
 
@@ -829,7 +977,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
         self.metadata.to_context()
     }
 
-    #[inline]
+    #[inline] // marked inline because sometimes called from a generic context
     unsafe fn erased_dealloc(
         header_ptr: NonNull<RawBrcHeader>,
         ctx: ErasedDestructorContext,
@@ -841,9 +989,36 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
+        /// Guard to drop the weak reference shared by all strong references.
+        ///
+        /// This guard ensures that the underlying memory is freed,
+        /// even if the destructor of `T` panics.
+        ///
+        /// We can not use a real [`Weak`] pointer directly as that has stricter bounds on `T`
+        /// in order to do the layout calculation.
+        struct WeakDropGuard<A: Allocator> {
+            header_ptr: NonNull<BrcHeader<A>>,
+            layout_info: LayoutInfo<A>,
+        }
+        impl<A: Allocator> Drop for WeakDropGuard<A> {
+            #[inline]
+            fn drop(&mut self) {
+                // SAFETY: Safe to drop because we are last strong reference
+                unsafe {
+                    BrcHeader::<A>::drop_weak(self.header_ptr.cast().as_ptr(), self.layout_info);
+                }
+            }
+        }
         // SAFETY: Valid since T has not been dropped yet.
         // However, this violates stacked borrow. It works fine for tree borrows)
         let layout = unsafe { Layout::for_value(&*value) };
+        // SAFETY: Know the layout will not overflow since already allocated
+        let layout_info = unsafe { LayoutInfo::<A>::new(layout).unwrap_unchecked() };
+        debug_assert_eq!(layout_info.value_offset, value_offset);
+        let weak_guard = WeakDropGuard {
+            header_ptr: header_ptr.cast(),
+            layout_info,
+        };
         if core::mem::needs_drop::<T>() {
             // SAFETY: Caller guarantees this is not invoked until it is valid to drop
             unsafe { core::ptr::drop_in_place(value) }
@@ -851,21 +1026,8 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
         const {
             assert!(!RawBrcHeader::NEEDS_DROP);
         }
-        // Move the allocator out of the header
-        // SAFETY: Will never be used again after dealloc
-        let alloc: A = unsafe {
-            header_ptr
-                .as_ptr()
-                .cast::<BrcHeader<A>>()
-                .byte_add(core::mem::offset_of!(BrcHeader<A>, alloc))
-                .cast::<A>()
-                .read()
-        };
-        // SAFETY: Know the layout will not overflow since already allocated
-        let layout_info = unsafe { LayoutInfo::<A>::new(layout).unwrap_unchecked() };
-        debug_assert_eq!(layout_info.value_offset, value_offset);
-        // SAFETY: Caller guarantees it is valid to drop the header too
-        unsafe { alloc.deallocate(header_ptr.cast(), layout_info.full_layout) };
+        // Explicitly drop the weak reference shared by all the strong references
+        drop(weak_guard);
     }
 }
 
@@ -880,21 +1042,303 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
 /// Effectively sealed, so all implementations can be trusted.
 pub trait SupportedPointee: SupportedPointeeInternal {}
 
+/// A type that can be used in a [`Weak`]
+///
+/// This is more not implemented for as many types as [`SupportedWeakPointee`],
+/// as it is more difficult to polyfill the functionality that [`Weak`] needs.
+pub trait SupportedWeakPointee: SupportedPointee + SupportedWeakPointeeInternal {}
+
+/// A weak-reference to a [`Brc`].
+///
+/// Mirrors [`std::sync::Weak`].
+#[repr(transparent)]
+pub struct Weak<T: ?Sized + SupportedWeakPointee, A: Allocator = Global> {
+    /// Either a pointer to where the value used to be,
+    /// or [`usize::MAX`] if returned from [`Weak::new`].
+    ///
+    /// This value can never be held by a valid pointer since [`LayoutInfo::MIN_VALUE_ALIGNMENT`]
+    /// is greater than one.
+    ///
+    /// If the value is reserved, it must use the [`Global`] allocator.
+    /// This is necessary for [`Weak::allocator`] to work correctly.
+    value_ptr_or_reserved: NonNull<T>,
+    alloc_marker: PhantomData<A>,
+}
+impl<T, A: Allocator> Default for Weak<T, A> {
+    #[inline]
+    fn default() -> Self {
+        Weak::new()
+    }
+}
+impl<T, A: Allocator> Weak<T, A> {
+    /// A [`Weak`] instance that points to nothing,
+    /// and can never be upgraded.
+    ///
+    /// Mirrors [`std::sync::Weak::new`].
+    #[inline]
+    pub const fn new() -> Self {
+        const {
+            assert!(LayoutInfo::<A>::MIN_VALUE_ALIGNMENT >= 2);
+        }
+        Weak {
+            value_ptr_or_reserved: NonNull::without_provenance(NonZeroUsize::MAX),
+            alloc_marker: PhantomData,
+        }
+    }
+}
+
+/// Marker returned from [`Weak::value_ptr`] to indicate the reserved value is being used.
+#[derive(Copy, Clone, Debug)]
+struct ReservedWeakValue;
+
+impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
+    /// The allocator that the weak reference originated from.
+    ///
+    /// Mirrors [`Weak::allocator`].
+    #[inline]
+    pub fn allocator(&self) -> &A {
+        match self.header() {
+            Ok(header) => &header.alloc,
+            Err(ReservedWeakValue) => {
+                const GLOBAL_REF: &Global = &Global;
+                // SAFETY: The reserved value must use the global allocator
+                unsafe { &*core::ptr::from_ref(GLOBAL_REF).cast::<A>() }
+            }
+        }
+    }
+
+    #[inline]
+    fn value_ptr(&self) -> Result<NonNull<T>, ReservedWeakValue> {
+        if self.value_ptr_or_reserved.addr() != NonZeroUsize::MAX {
+            // we know its not reserved
+            Ok(self.value_ptr_or_reserved)
+        } else {
+            Err(ReservedWeakValue)
+        }
+    }
+
+    #[inline]
+    fn value_layout(&self) -> Result<Layout, ReservedWeakValue> {
+        // SAFETY: Value pointer used to be valid,
+        // so we can call Layout::for_Value
+        Ok(unsafe { T::layout_for_ptr(self.value_ptr()?.as_ptr()) })
+    }
+
+    #[inline]
+    fn layout_info(&self) -> Result<LayoutInfo<A>, ReservedWeakValue> {
+        let value_layout = self.value_layout()?;
+        // SAFETY: Since allocation was successful,
+        // we know that this layout calculation cannot fail
+        Ok(unsafe { LayoutInfo::new(value_layout).unwrap_unchecked() })
+    }
+
+    #[inline]
+    fn header_ptr(&self) -> Result<NonNull<BrcHeader<A>>, ReservedWeakValue> {
+        let layout_info = self.layout_info()?;
+        // SAFETY: We trust the `header_offset` from the layout info to be valid
+        Ok(unsafe {
+            self.value_ptr()?
+                .byte_offset(layout_info.header_offset())
+                .cast::<BrcHeader<A>>()
+        })
+    }
+
+    #[inline]
+    fn header(&self) -> Result<&BrcHeader<A>, ReservedWeakValue> {
+        // SAFETY: We trust the returned pointer to live for &self
+        Ok(unsafe { self.header_ptr()?.as_ref() })
+    }
+
+    /// Upgrade to an owned reference,
+    /// returning `None` if the memory has been freed.
+    ///
+    /// Mirrors [`std::sync::Weak::upgrade`].
+    #[inline]
+    #[expect(clippy::missing_panics_doc, reason = "should never panic")]
+    pub fn upgrade(&self) -> Option<Brc<T, A>> {
+        let value_ptr = self.value_ptr().ok()?;
+        let header = self.header().unwrap();
+        match header.rc.increment_strong_unless_zero() {
+            Ok(()) => {
+                // SAFETY: Success of increment_strong means we have an owned references
+                unsafe { Some(Brc::from_raw(value_ptr.as_ptr())) }
+            }
+            Err(runtime::ZeroReferenceCountError) => None,
+        }
+    }
+
+    /// Recreate a weak references from a raw pointer.
+    ///
+    /// Consumes ownership of a weak reference.
+    ///
+    /// # Safety
+    /// Pointer must have originally come from [`Brc::into_raw`],
+    /// and correspond to an owned weak reference.
+    ///
+    /// Mirrors the requirements of [`Brc::from_raw`].
+    #[inline]
+    pub unsafe fn from_raw(ptr: *const T) -> Self {
+        Weak {
+            // SAFETY: Caller guarantees the pointer is valid ,
+            // and into_raw never returns null
+            value_ptr_or_reserved: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
+            alloc_marker: PhantomData,
+        }
+    }
+
+    /// Convert a weak reference into a raw pointer.
+    #[inline]
+    pub fn into_raw(self) -> *const T {
+        let this = ManuallyDrop::new(self);
+        this.as_ptr()
+    }
+
+    /// Get a raw pointer to the underlying object.
+    ///
+    /// The object is valid only if there are still strong references to the value.
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.value_ptr_or_reserved.as_ptr()
+    }
+}
+impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.value_ptr().is_ok() {
+            let layout_info = self.layout_info().unwrap();
+            let header_ptr = self.header_ptr().unwrap();
+            // SAFETY: Our existence implies we own a weak reference
+            unsafe {
+                BrcHeader::drop_weak(header_ptr.as_ptr(), layout_info);
+            }
+        }
+    }
+}
+impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self.header() {
+            Ok(header) => {
+                // cannot possibly be locked as justified by std::sync::Weak::clone
+                let old_count = header.weak_count.fetch_add(1, Ordering::AcqRel);
+                if old_count > WEAK_OVERFLOW_THRESHOLD {
+                    runtime::fatal_errors::weak_refcnt_overflow();
+                }
+                Weak {
+                    alloc_marker: PhantomData,
+                    value_ptr_or_reserved: self.value_ptr_or_reserved,
+                }
+            }
+            Err(ReservedWeakValue) => Weak {
+                alloc_marker: PhantomData,
+                value_ptr_or_reserved: self.value_ptr_or_reserved,
+            },
+        }
+    }
+}
+// We might be able to be more conservative with these bounds,
+// but this is what std::sync::Weak does
+// SAFETY: We are careful to be thread-safe
+unsafe impl<T: ?Sized + SupportedWeakPointee + Send + Sync, A: Allocator + Send + Sync> Send
+    for Weak<T, A>
+{
+}
+// SAFETY: We are careful to be thread-safe
+unsafe impl<T: ?Sized + SupportedWeakPointee + Send + Sync, A: Allocator + Send + Sync> Sync
+    for Weak<T, A>
+{
+}
+
+impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Debug for Weak<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.write_str("(Weak)")
+    }
+}
+
 /// The internals of [`SupportedPointee`], using the [`ptr_meta`] crate.
 mod pointee {
     use crate::runtime::ErasedDestructorContext;
+    use core::alloc::Layout;
     #[cfg(feature = "nightly-ptr-meta")]
     use core::ptr as ptr_meta;
     use ptr_meta::{DynMetadata, Pointee};
     #[cfg(not(feature = "nightly-ptr-meta"))]
     use ptr_meta_stable as ptr_meta;
 
-    /// The sealed internals of [`SupportedPointee`], hidden from the public.
+    /// The sealed internals of [`super::SupportedPointee`], hidden from the public.
     ///
     /// This performs double-duty by ensuring the trait is sealed.
     pub trait SupportedPointeeInternal: Pointee<Metadata: SupportedMetadata> {}
     impl<T: ?Sized + Pointee> SupportedPointeeInternal for T where T::Metadata: SupportedMetadata {}
     impl<T: ?Sized + Pointee> super::SupportedPointee for T where T::Metadata: SupportedMetadata {}
+
+    /// The sealed internals of [`super::SupportedWeakPointee`], hidden from the public.
+    ///
+    /// This is more restrictive than [`SupportedPointeeInternal`]
+    /// due to the need to calculate layout information.
+    pub trait SupportedWeakPointeeInternal: SupportedPointeeInternal {
+        /// Determine the layout of a value behind the specified pointer.
+        ///
+        /// # Safety
+        /// Same requirements [`Layout::for_value_raw`].
+        unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout;
+    }
+
+    /// If we are permitted to use the nightly [`Layout::for_value_raw`] method,
+    /// than weak references can be made to any `?Sized` type.
+    #[cfg(feature = "nightly-ptr-layout")]
+    mod nightly_weak_pointee {
+        use super::{Layout, Pointee, SupportedMetadata, SupportedWeakPointeeInternal};
+        use crate::SupportedWeakPointee;
+        impl<T: ?Sized + Pointee> SupportedWeakPointeeInternal for T
+        where
+            T::Metadata: SupportedMetadata,
+        {
+            #[inline]
+            unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
+                // SAFETY: Caller promises to uphold the appropriate invariants
+                unsafe { Layout::for_value_raw(ptr.cast_const()) }
+            }
+        }
+        impl<T: ?Sized + Pointee> SupportedWeakPointee for T where T::Metadata: SupportedMetadata {}
+    }
+    /// If we are on stable rust, then weak references can only be made to `Sized` types,
+    /// to slices, and to `str` references.
+    ///
+    /// We currently do not support weak references with `dyn` trait objects on stable rust.
+    /// While in theory we could use [`ptr_meta::DynMetadata::layout`],
+    /// I ran into trait coherence issues last time I tried to add it.
+    #[cfg(not(feature = "nightly-ptr-layout"))]
+    mod stable_weak_pointee {
+        use super::{Layout, SupportedWeakPointeeInternal};
+        use crate::SupportedWeakPointee;
+        impl<T> SupportedWeakPointee for T {}
+        #[cfg(not(feature = "nightly-ptr-layout"))]
+        impl<T> SupportedWeakPointeeInternal for T {
+            #[inline]
+            unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
+                let _ = ptr;
+                Layout::new::<T>()
+            }
+        }
+        impl<T> SupportedWeakPointeeInternal for [T] {
+            #[inline]
+            unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
+                // SAFETY: If we have already been allocated,
+                // then the layout cannot overflow
+                unsafe { Layout::array::<T>(ptr.len()).unwrap_unchecked() }
+            }
+        }
+        impl<T> SupportedWeakPointee for [T] {}
+        impl SupportedWeakPointeeInternal for str {
+            #[inline]
+            unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
+                // SAFETY: Caller guarantees pointer is valid
+                unsafe { SupportedWeakPointeeInternal::layout_for_ptr(ptr as *mut [u8]) }
+            }
+        }
+        impl SupportedWeakPointee for str {}
+    }
 
     /// Indicates that the metadata is supported, meaning it is at most pointer sized.
     ///
@@ -1103,13 +1547,13 @@ impl<T: ?Sized + SupportedPointee + PartialEq, A: Allocator> PartialEq for Brc<T
 }
 impl<T: ?Sized + SupportedPointee + PartialOrd, A: Allocator> PartialOrd for Brc<T, A> {
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         self.deref().partial_cmp(other.deref())
     }
 }
 impl<T: ?Sized + SupportedPointee + Ord, A: Allocator> Ord for Brc<T, A> {
     #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.deref().cmp(other.deref())
     }
 }
@@ -1141,6 +1585,14 @@ where
 {
 }
 
+#[cfg(feature = "nightly-coerce")]
+impl<T: ?Sized, U: ?Sized> CoerceUnsized<Weak<U>> for Weak<T>
+where
+    T: Unsize<U> + SupportedWeakPointee,
+    U: SupportedWeakPointee,
+{
+}
+
 // SAFETY: Preserves target and provenance in replace_ptr
 unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> {
     type Pointee = T;
@@ -1166,5 +1618,33 @@ unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> 
         let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
         // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
         unsafe { Brc::from_raw(new) }
+    }
+}
+
+// SAFETY: Preserves target and provenance in replace_ptr
+unsafe impl<T, U: ?Sized + SupportedWeakPointee> unsize::CoerciblePtr<U> for Weak<T> {
+    type Pointee = T;
+    type Output = Weak<U>;
+
+    #[inline]
+    fn as_sized_ptr(&mut self) -> *mut Self::Pointee {
+        // Use deref to acquire pointer to self
+        // NOTE: Turning this into an &mut T is UB if there is shared ownership
+        Weak::as_ptr(&*self).cast_mut()
+    }
+
+    #[inline]
+    unsafe fn replace_ptr(self, new: *mut U) -> Self::Output {
+        // SAFETY: Caller has guaranteed that `new` is
+        // just an unsized version of the original
+        //
+        // Ownership is correctly transferred from `self` to result.
+
+        // Provenance transferred into `raw` as per `into_raw`.
+        let raw = Self::into_raw(self).cast_mut();
+        // SAFETY: Provenance merged into `new` as per `replace_ptr`.
+        let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
+        // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
+        unsafe { Weak::from_raw(new) }
     }
 }

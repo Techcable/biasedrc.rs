@@ -1,6 +1,6 @@
 //! Basic smoke tests.
 
-use biasedrc::Brc;
+use biasedrc::{Brc, Weak};
 use std::error::Error;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -156,4 +156,36 @@ fn get_mut() {
             });
         });
     }
+}
+
+#[test]
+fn weak_downgrade_then_upgrade() {
+    let strong = Brc::new(42);
+    let weak = Brc::downgrade(&strong);
+    let upgrade = Weak::upgrade(&weak).unwrap();
+    assert_eq!(strong, upgrade);
+}
+
+#[test]
+fn weak_forget_then_upgrade() {
+    let strong = Brc::new(42);
+    let weak = Brc::downgrade(&strong);
+    drop(strong);
+    assert_eq!(Weak::upgrade(&weak), None);
+}
+
+#[test]
+fn weak_dummy_upgrade() {
+    let weak = Weak::<i32>::new();
+    assert_eq!(weak.upgrade(), None);
+}
+
+#[test]
+fn weak_slices() {
+    let strong: Brc<[i32]> = Brc::from(vec![1, 2, 3]);
+    let weak = Brc::downgrade(&strong);
+    assert_eq!(Some(strong), Weak::upgrade(&weak));
+    let strong: Brc<str> = Brc::from("foo");
+    let weak = Brc::downgrade(&strong);
+    assert_eq!(Some(strong), Weak::upgrade(&weak));
 }

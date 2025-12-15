@@ -28,6 +28,10 @@ nightly-coerce = []
 #
 # Adding this feature can break code that assumes `allocator_api2` is being used.
 nightly-allocator = []
+# Use the nightly `layout_for_ptr` feature.
+#
+# This is currently necessary to support `Weak` pointers for non-sized targets
+nightly-ptr-layout = ["nightly-ptr-meta"]
 # Enable serde serialization support
 serde = ["dep:serde"]
 # Implement archery::SharedPointerKind

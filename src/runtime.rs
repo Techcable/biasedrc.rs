@@ -37,6 +37,11 @@ pub struct ImpreciseRefCountError {
     lower_bound: usize,
 }
 
+/// The result of calling [`RawBrcHeader::increment_strong_unless_zero`]
+/// if the strong reference count is zero.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ZeroReferenceCountError;
+
 /// The result of calling [`RawBrcHeader::decrement_strong`],
 /// indicating whether the value needs to be dropped.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -208,6 +213,14 @@ impl RawBrcHeader {
         }
     }
 
+    /// Return `true` quickly if we are definitely not a unique reference.
+    #[inline]
+    pub fn is_definitely_not_unique(&self) -> bool {
+        let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
+        let this_thread_id = LocalThreadState::existing_short_id().ok();
+        biased_word.owner_id.is_some() && biased_word.owner_id != this_thread_id
+    }
+
     /// Attempt to determine if the reference count is unique.
     ///
     /// May have false negatives if not on the biased thread,
@@ -309,6 +322,49 @@ impl RawBrcHeader {
         let new_word = SharedWord::from_raw(self.shared_word.fetch_add(1, Ordering::Relaxed));
         if new_word.shared_count > SharedWord::OVERFLOW_THRESHOLD {
             fatal_errors::shared_refcnt_overflow();
+        }
+    }
+
+    /// Attempt to increment the object's strong count,
+    /// unless the object's count is already at zero.
+    #[inline]
+    pub fn increment_strong_unless_zero(&self) -> Result<(), ZeroReferenceCountError> {
+        // If attempt_biased_increment succeeds,
+        // we know that the overall shared count is nonzero
+        //
+        // This relies upon the fact that merged counts clear the owner field
+        if self.attempt_biased_increment().is_ok() {
+            Ok(())
+        } else {
+            match self
+                .shared_word
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old_shared| {
+                    let old_shared = SharedWord::from_raw(old_shared);
+                    let is_dead = old_shared.merged && old_shared.shared_count.value() == 0;
+                    if cfg!(debug_assertions)
+                        && old_shared.merged
+                        && old_shared.shared_count.value() < 0
+                    {
+                        undefined_behavior::negative_refcnt_merge();
+                    }
+                    if is_dead {
+                        None
+                    } else {
+                        Some(
+                            SharedWord {
+                                shared_count: old_shared
+                                    .shared_count
+                                    .checked_add(SharedCount::new(1))
+                                    .unwrap_or_else(|| fatal_errors::shared_refcnt_overflow()),
+                                ..old_shared
+                            }
+                            .to_raw(),
+                        )
+                    }
+                }) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(ZeroReferenceCountError),
+            }
         }
     }
 
@@ -897,7 +953,7 @@ pub fn collect_force() {
 /// but only in highly degenerate cases.
 /// The standard example is leaking a billion references,
 /// which causes [`Arc::clone`] to abort as well.
-mod fatal_errors {
+pub(crate) mod fatal_errors {
     macro_rules! fatal_error {
         ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {
             #[cold]
@@ -913,6 +969,7 @@ mod fatal_errors {
     fatal_error!(shared_refcnt_underflow => "Reference count underflow for shared counter");
     fatal_error!(shared_refcnt_overflow => "Reference count overflow for a shared counter");
     fatal_error!(merged_refcnt_overflow => "Merged reference counts overflow the shared counter");
+    fatal_error!(weak_refcnt_overflow => "Weak reference counts overflowed its counter");
 }
 
 /// Encountered a situation that is undefined behavior.
