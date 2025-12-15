@@ -250,6 +250,11 @@ impl RawBrcHeader {
             .ok_or(FastIncrementFailure)?;
         let this_id = LocalThreadState::existing_short_id().map_err(|_| FastIncrementFailure)?;
         if biased_word.owner_id == Some(this_id) {
+            // The biased count cannot be zero, unless the count has been merged.
+            // If the count has been merged, we should never be marked as owned.
+            if cfg!(debug_assertions) && biased_word.biased_count.value() == 0 {
+                undefined_behavior::biased_count_zero_and_owned();
+            }
             self.biased_word.store(
                 BiasedWord {
                     biased_count: incremented_counter,
@@ -408,16 +413,19 @@ impl RawBrcHeader {
             ..old_shared
         };
         debug_assert!(new_shared.shared_count.value() >= 0);
-        let should_drop: bool;
-        if new_shared.shared_count.value() == 0 {
-            should_drop = true;
-        } else {
-            // release ownership
-            self.biased_word
-                .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
-            should_drop = false;
+        // release ownership
+        //
+        // Once we merge reference counts,
+        // we need to release ownership so that we are never incremented again.
+        //
+        // This needs to be done even if we `should_drop`,
+        // as features like weak references could observe the strong count
+        // even after the primary value is dropped.
+        self.biased_word
+            .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+        StrongDecrementResult {
+            should_drop: new_shared.shared_count.value() == 0,
         }
-        StrongDecrementResult { should_drop }
     }
 
     #[cold]
@@ -767,6 +775,14 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             }
         }
     }
+    // must always release ownership/unbias
+    // as once the counter is merged, it can never be biased again
+    //
+    // This is needs to be done even if we end up dropping the value,
+    // as weak references can observe the strong count after we are dropped.
+    header
+        .biased_word
+        .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
     match new_word.shared_count.value().cmp(&0) {
         core::cmp::Ordering::Less => {
             // This can only happen if there are more drops then clones, which is UB
@@ -778,10 +794,7 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
             unsafe { object.drop.dealloc(object.header_ptr) }
         }
         core::cmp::Ordering::Greater => {
-            // release ownership/unbias
-            header
-                .biased_word
-                .store(BiasedWord::UNOWNED.to_raw(), Ordering::Relaxed);
+            // still have strong references to the value, so nothing more is needed
         }
     }
 }
@@ -820,6 +833,11 @@ pub fn collect_force() {
 }
 
 /// Internal errors that should trigger aborts.
+///
+/// These can technically be triggered by safe code,
+/// but only in highly degenerate cases.
+/// The standard example is leaking a billion references,
+/// which causes [`Arc::clone`] to abort as well.
 mod fatal_errors {
     macro_rules! fatal_error {
         ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {
@@ -839,6 +857,10 @@ mod fatal_errors {
 }
 
 /// Encountered a situation that is undefined behavior.
+///
+/// Not all of these situations cause undefined behavior immediately.
+/// Sometimes they indicate that internal invariants have been seriously corrupted
+/// and there is no way to sensibly continue.
 ///
 /// This does not ever call [`core::hint::unreachable_unchecked`],
 /// but instead aborts with a descriptive error message.
@@ -861,4 +883,5 @@ mod undefined_behavior {
     undefined_behavior!(negative_refcnt_no_owner => "Negative reference count but no biased thread");
     undefined_behavior!(owner_undefined_state => "Biased thread has undefined state, but still owns objects");
     undefined_behavior!(strong_count_arith_overflow => "Computing the strong_count either overflowed (impossible) or underflowed (UB) a counter");
+    undefined_behavior!(biased_count_zero_and_owned => "Reference is biased towards a particular thread, but has a zero refcount");
 }
