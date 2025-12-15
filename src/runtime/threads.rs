@@ -446,6 +446,8 @@ thread_local! {
     static THIS_THREAD_STATE_FAST: LocalThreadStateFast = const { LocalThreadStateFast {
         status: Cell::new(LocalThreadStatus::Uninit),
         short_id: Cell::new(None),
+        // This requires at least Rust 1.90
+        // Versions before that don't let us reference `Cell` statics in a constant
         shared_state_flag: Cell::new(&DUMMY_STATE_FLAG),
     } };
 }

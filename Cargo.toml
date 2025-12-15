@@ -7,6 +7,11 @@ categories = ["concurrency", "rust-patterns", "memory-management"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Techcable/biasedrc.rs"
 keywords = ["biasedrc", "arc", "rc"]
+# 1.83 - const Option::unwrap
+# 1.84 - strict provenance API
+# 1.85 - 2024 edition
+# 1.90 - constants can reference mutable statics
+rust-version = "1.90"
 
 [features]
 # Use the nightly pointer metadata feature instead of the stable one
