@@ -32,6 +32,10 @@ nightly-allocator = []
 #
 # This is currently necessary to support `Weak` pointers for non-sized targets
 nightly-ptr-layout = ["nightly-ptr-meta"]
+# Use the nightly `#[may_dangle]` attribute to relax dropcheck requiremets
+#
+# See the "Drop Check" section of the nomicon for details.
+nightly-may-dangle = []
 # Enable serde serialization support
 serde = ["dep:serde"]
 # Implement archery::SharedPointerKind

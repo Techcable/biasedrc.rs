@@ -12,6 +12,7 @@
 #![cfg_attr(feature = "nightly-coerce", feature(coerce_unsized, unsize))]
 #![cfg_attr(feature = "nightly-ptr-layout", feature(layout_for_ptr))]
 #![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
+#![cfg_attr(feature = "nightly-may-dangle", feature(dropck_eyepatch))]
 #![deny(
     missing_docs,
     clippy::std_instead_of_core,
@@ -904,7 +905,25 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Deref for Brc<T, A> {
         unsafe { self.ptr.as_ref() }
     }
 }
-impl<T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
+macro_rules! drop_may_dangle {
+    (unsafe impl<#[may_dangle] $primary:ident: ?Sized + $primary_bound:ident, $alloc:ident: $alloc_bound:ident> Drop for $target:path {
+        $($inner:tt)*
+
+    }) => {
+        #[cfg(feature = "nightly-may-dangle")]
+        // SAFETY: Guaranteed by caller
+        unsafe impl<#[may_dangle] $primary: ?Sized + $primary_bound, $alloc: $alloc_bound> Drop for $target {
+            $($inner)*
+        }
+        #[cfg(not(feature = "nightly-may-dangle"))]
+        impl<$primary: ?Sized + $primary_bound, $alloc: $alloc_bound> Drop for $target {
+            $($inner)*
+        }
+    };
+}
+drop_may_dangle! {
+// SAFETY: We respect the #[may_dangle] requirements
+unsafe impl<#[may_dangle] T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
     /// Drops a reference to the underlying object,
     /// potentially freeing it if there are otherwise no references.
     ///
@@ -929,6 +948,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
             Self::drop_no_collect_in_place(self);
         }
     }
+}
 }
 impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     /// Create a new reference to the underlying object.
@@ -1201,7 +1221,9 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         self.value_ptr_or_reserved.as_ptr()
     }
 }
-impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
+drop_may_dangle! {
+// SAFETY: We respect the may_dangle requirements
+unsafe impl<#[may_dangle] T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
     #[inline]
     fn drop(&mut self) {
         if self.value_ptr().is_ok() {
@@ -1213,6 +1235,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
             }
         }
     }
+}
 }
 impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
     #[inline]
