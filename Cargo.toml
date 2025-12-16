@@ -14,6 +14,16 @@ keywords = ["biasedrc", "arc", "rc"]
 rust-version = "1.90"
 
 [features]
+# Enable all recommended features on the nightly channel.
+#
+# These features make Brc easier to use and a better drop-in replacement for Arc.
+# However, taking advantage of these features could make it harder for your code to support stable rust.
+nightly = [
+    "nightly-ptr-meta",
+    "nightly-coerce",
+    "nightly-ptr-layout",
+    "nightly-may-dangle",
+]
 # Use the nightly pointer metadata feature instead of the stable one
 #
 # Removing this feature could break some code,
