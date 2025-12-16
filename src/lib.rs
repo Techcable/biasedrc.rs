@@ -1060,12 +1060,14 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
 ///
 /// # Safety
 /// Effectively sealed, so all implementations can be trusted.
+#[doc(hidden)]
 pub trait SupportedPointee: SupportedPointeeInternal {}
 
 /// A type that can be used in a [`Weak`]
 ///
 /// This is more not implemented for as many types as [`SupportedWeakPointee`],
 /// as it is more difficult to polyfill the functionality that [`Weak`] needs.
+#[doc(hidden)]
 pub trait SupportedWeakPointee: SupportedPointee + SupportedWeakPointeeInternal {}
 
 /// A weak-reference to a [`Brc`].
