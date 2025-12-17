@@ -74,27 +74,6 @@ impl RawBrcHeader {
     /// This is true regardless of what [`std::mem::needs_drop`] claims.
     pub const NEEDS_DROP: bool = false;
 
-    /// Lazily initialize the [`threads::THIS_THREAD_STATE`] thread-local variable,
-    /// returning the [`ShortThreadId`] if any.
-    ///
-    /// Moving this to a separate function avoids a second TLS access in the hot-path [`Self::init`].
-    /// We previously called [`LocalThreadState::with_current`] at the beginning of [`Self::init`]
-    /// to ensure the thread state is fully initialized before we asked for the ID.
-    /// However, this means we needed to access two thread locals:
-    /// - [`threads::THIS_THREAD_STATE`] to get the ID and lazy-init the state
-    /// - [`threads::THIS_THREAD_STATE_FAST`] to check if [`crate::collect`] is needed
-    ///
-    /// What is worse, the first TLS was lazy-initialized,
-    /// so it needed an initialization check every time.
-    /// Instead, we just check [`threads::THIS_THREAD_STATE_FAST`] in the hot-path,
-    /// and call out to this function if the state hasn't been initialized yet.
-    /// This is measurably faster (about 9%) than the old approach.
-    #[cold]
-    #[inline(never)]
-    fn init_tid() -> Option<ShortThreadId> {
-        LocalThreadState::with_current(LocalThreadState::short_id).ok()
-    }
-
     /// Initialize the header, biasing towards the current thread.
     ///
     /// # Safety
@@ -110,7 +89,7 @@ impl RawBrcHeader {
             }
             Err(LocalThreadAccessError::Uninitialized) => {
                 // Need to actually initialize the thread state
-                Self::init_tid()
+                LocalThreadState::init_tid()
             }
         };
         match this_id {
@@ -628,9 +607,9 @@ impl Debug for RawBrcHeader {
 /// but with extra functionality to deal with fat-pointers,
 /// computation of header offsets, and dynamic dispatch.
 ///
-/// Use a monomorphized [`TypeInfo`] over an [`ErasedDestructorFunc`] wherever possible.
+/// Use a monomorphized [`DropInfo`] over an [`ErasedDropInfo`] wherever possible.
 /// It not only avoids a virtual call, but can avoid passing some pointless parameters
-/// like [`Self::header_offset`] (often a constant) or [`Self::erased_context`] (often a thin-pointer)
+/// like [`Self::value_offset`] (often a constant) or [`Self::erased_context`] (often a thin-pointer)
 ///
 /// # Safety
 /// This trait is safe to implement, but all uses are unsafe.
@@ -694,7 +673,7 @@ struct BiasedWord {
     biased_count: BiasedCount,
 }
 impl BiasedWord {
-    /// The number of bits this value takes when packed with [`SelF::to_raw`].
+    /// The number of bits this value takes when packed with [`Self::to_raw`].
     ///
     /// This is not necessarily equal to `size_of::<Self>() * 8`,
     /// because that is the unpacked size,
@@ -792,7 +771,7 @@ struct SharedWord {
     queued: bool,
 }
 impl SharedWord {
-    /// The number of bits this value takes when packed with [`SelF::to_raw`].
+    /// The number of bits this value takes when packed with [`Self::to_raw`].
     ///
     /// This is not necessarily equal to `size_of::<Self>() * 8`,
     /// because that is the unpacked size,
@@ -801,8 +780,8 @@ impl SharedWord {
     const QUEUED_BIT: usize = 1 << (SharedCount::BITS + 1);
     /// The threshold past which a reference count should be considered to have overflown.
     ///
-    /// This is checked against the result of calling [`fetch_add`] to check for overflow.
-    /// Use of `fetch_add` is noticeably faster than calling [`checked_add`] in a CAS loop,
+    /// This is checked against the result of calling [`AtomicUsize::fetch_add`] to check for overflow.
+    /// Use of `fetch_add` is noticeably faster than calling [`usize::checked_add`] in a CAS loop,
     /// but comes with the risk of the `fetch_add`
     /// overflowing and then the thread going to sleep before the panic can occur.
     /// If enough threads end up incrementing the counter, then go to sleep,
@@ -952,7 +931,7 @@ pub fn collect_force() {
 /// These can technically be triggered by safe code,
 /// but only in highly degenerate cases.
 /// The standard example is leaking a billion references,
-/// which causes [`Arc::clone`] to abort as well.
+/// which causes [`std::sync::Arc::clone`] to abort as well.
 pub(crate) mod fatal_errors {
     macro_rules! fatal_error {
         ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {

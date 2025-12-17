@@ -41,7 +41,7 @@ enum ThreadStateFlag {
     /// While this state is present, the death lock must not be acquired.
     /// Otherwise, other threads could block the thread destructor.
     ///
-    /// This state implies that [`LocalThreadState::current`] will never succeed again,
+    /// This state implies that [`LocalThreadState::with_current`] will never succeed again,
     /// ensuring the biased thread will not manipulate the shared count.
     Dying,
     /// Indicates that the thread is dead and has finished executing the destructor.
@@ -229,6 +229,30 @@ impl LocalThreadState {
     pub fn short_id(&self) -> ShortThreadId {
         self.short_id
     }
+
+    /// Lazily initialize the [`THIS_THREAD_STATE`] thread-local variable,
+    /// returning the [`ShortThreadId`] if any.
+    ///
+    /// Moving this to a separate function avoids a second TLS access in the hot-path [`RawBrcHeader::init`].
+    /// We previously called [`LocalThreadState::with_current`] at the beginning of [`RawBrcHeader::init`]
+    /// to ensure the thread state is fully initialized before we asked for the ID.
+    /// However, this means we needed to access two thread locals:
+    /// - [`THIS_THREAD_STATE`] to get the ID and lazy-init the state
+    /// - [`THIS_THREAD_STATE_FAST`] to check if [`crate::collect`] is needed
+    ///
+    /// What is worse, the first TLS was lazy-initialized,
+    /// so it needed an initialization check every time.
+    /// Now all we have to do is check [`THIS_THREAD_STATE_FAST`] in the hot-path,
+    /// and call out to this function if the state hasn't been initialized yet.
+    /// This is measurably faster (about 9%) than the old approach.
+    ///
+    /// [`RawBrcHeader::init`]: super::RawBrcHeader::init
+    #[cold]
+    #[inline(never)]
+    pub fn init_tid() -> Option<ShortThreadId> {
+        LocalThreadState::with_current(LocalThreadState::short_id).ok()
+    }
+
     /// Access the current thread info inside the specified closure.
     ///
     /// # Safety
@@ -241,7 +265,7 @@ impl LocalThreadState {
     /// This case cannot actually happen,
     /// as if the thread is live at the beginning of the closure,
     /// it will still be live by the end.
-    /// This is similar reasoning for why [`core::thread::LocalKey::with`] is safe.
+    /// This is similar reasoning for why [`std::thread::LocalKey::with`] is safe.
     ///
     /// It is well-defined to invoke this after the destructor is finished or in-progress.
     /// The state is updated appropriately at the beginning of the destructor,
@@ -419,7 +443,7 @@ static DUMMY_STATE_FLAG: Atomic<ThreadStateFlag> = Atomic::new(ThreadStateFlag::
 pub struct LocalThreadStateFast {
     status: Cell<LocalThreadStatus>,
     short_id: Cell<Option<ShortThreadId>>,
-    /// A reference to the thread state flag stored in the [`SharedThreadState`].
+    /// A reference to the thread state flag stored in the [`SharedThreadInfo`].
     ///
     /// Used to tell if collection needs to be performed.
     ///
