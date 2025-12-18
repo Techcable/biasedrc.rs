@@ -1086,13 +1086,13 @@ pub struct Weak<T: ?Sized + SupportedWeakPointee, A: Allocator = Global> {
     value_ptr_or_reserved: NonNull<T>,
     alloc_marker: PhantomData<A>,
 }
-impl<T, A: Allocator> Default for Weak<T, A> {
+impl<T> Default for Weak<T> {
     #[inline]
     fn default() -> Self {
         Weak::new()
     }
 }
-impl<T, A: Allocator> Weak<T, A> {
+impl<T> Weak<T> {
     /// A [`Weak`] instance that points to nothing,
     /// and can never be upgraded.
     ///
@@ -1100,7 +1100,7 @@ impl<T, A: Allocator> Weak<T, A> {
     #[inline]
     pub const fn new() -> Self {
         const {
-            assert!(LayoutInfo::<A>::MIN_VALUE_ALIGNMENT >= 2);
+            assert!(LayoutInfo::<Global>::MIN_VALUE_ALIGNMENT >= 2);
         }
         Weak {
             value_ptr_or_reserved: NonNull::without_provenance(NonZeroUsize::MAX),
