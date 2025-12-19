@@ -502,6 +502,23 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         this.header().rc.strong_count()
     }
 
+    /// Returns the number of weak pointers to the object,
+    /// or an error if that value cannot be precisely determined.
+    ///
+    /// # Errors
+    /// Gives an [`ImpreciseRefCountError`] if not on the biased thread,
+    /// and the true reference count cannot be determined.
+    #[inline]
+    pub fn weak_count(this: &Self) -> Result<usize, ImpreciseRefCountError> {
+        let weak_count = this.header().weak_count.load(Ordering::Relaxed);
+        if weak_count == WEAK_LOCKED_COUNT {
+            Ok(0) // can only happen if there was one weak reference
+        } else {
+            // exclude the strong count shared by all weak references
+            Ok((weak_count - 1) as usize)
+        }
+    }
+
     /// Determine if this [`Brc`] is uniquely owned.
     ///
     /// Mirrors [`std::sync::Arc::is_unique`].
