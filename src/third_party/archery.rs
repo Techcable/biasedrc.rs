@@ -14,7 +14,9 @@ impl BrcK {
     fn from_brc<T>(brc: Brc<T>) -> Self {
         let brc = ManuallyDrop::new(brc);
         BrcK {
-            value_ptr: brc.ptr.cast(),
+            // SAFETY: We know that the pointer is not null as it corresponds to a real allocation
+            // Even a ZST must have a header
+            value_ptr: unsafe { NonNull::new_unchecked(Brc::as_ptr(&brc).cast_mut()).cast() },
         }
     }
     #[inline]

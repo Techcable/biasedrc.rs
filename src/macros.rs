@@ -1,5 +1,23 @@
 //! Helper macros
 
+/// Implements [`core::ops::Drop`] with a `#[may_dangle]` attribute.
+macro_rules! drop_may_dangle {
+    (unsafe impl<#[may_dangle] $primary:ident: ?Sized + $primary_bound:ident, $alloc:ident: $alloc_bound:ident> Drop for $target:path {
+        $($inner:tt)*
+
+    }) => {
+        #[cfg(feature = "nightly-may-dangle")]
+        // SAFETY: Guaranteed by caller
+        unsafe impl<#[may_dangle] $primary: ?Sized + $primary_bound, $alloc: $alloc_bound> Drop for $target {
+            $($inner)*
+        }
+        #[cfg(not(feature = "nightly-may-dangle"))]
+        impl<$primary: ?Sized + $primary_bound, $alloc: $alloc_bound> Drop for $target {
+            $($inner)*
+        }
+    };
+}
+
 /// Implements smart-pointer logic common to [`crate::Weak`] and [`crate::Brc`].
 ///
 /// Use `SmartPointerBasics` if the type has no Deref to delegate to ([`crate::Weak`]),
