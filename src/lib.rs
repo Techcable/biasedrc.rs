@@ -847,6 +847,17 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         unsafe { Brc::from_raw(this.ptr.as_ptr()) }
     }
 
+    /// Checks if this points to the same object as the other.
+    ///
+    /// This does not compare pointer metadata for trait objects,
+    /// just like [`std::sync::Arc::ptr_eq`] and [`core::ptr::addr_eq`].
+    #[inline]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        // ignores trait object metadata, just like std::sync::Weak::ptr_eq
+        // slice length is irrelevant because Weak<[T]> always points to the full slice
+        core::ptr::addr_eq(Self::as_ptr(this), Self::as_ptr(other))
+    }
+
     /// Shared code for [`Self::drop_no_collect`] and [`drop`].
     ///
     /// # Safety
@@ -1233,6 +1244,19 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         self.value_ptr_or_reserved.as_ptr()
+    }
+
+    /// Checks if this weak points to the same object as the other.
+    ///
+    /// The result of [`Weak::new()`] is equal only to itself.
+    ///
+    /// This does not compare pointer metadata for trait objects,
+    /// just like [`std::sync::Weak::ptr_eq`] and [`core::ptr::addr_eq`].
+    #[inline]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        // ignores trait object metadata, just like std::sync::Weak::ptr_eq
+        // slice length is irrelevant because Weak<[T]> always points to the full slice
+        core::ptr::addr_eq(self.as_ptr(), other.as_ptr())
     }
 }
 drop_may_dangle! {
