@@ -36,6 +36,7 @@ macro_rules! drop_may_dangle {
 /// Use of `SmartPointerBasics` requires all the following:
 /// - The `into_raw/from_raw` methods work properly
 /// - The type can safely implement `Unpin`.
+/// - Must be [`bytemuck::ZeroableInOption`] when using the default allocator.
 ///
 /// Implementing `SmartPointer` also requires:
 /// - The pointer can implement [`stable_deref_trait::StableDeref`].
@@ -83,6 +84,17 @@ macro_rules! smart_pointer {
             U: $primary_bound,
         {
         }
+        #[doc = concat!("A [`", stringify!($pointer), "`] is just a [`NonNull`] pointer, so `Option<Self>` can be safely zero-initialized")]
+        ///
+        /// This requires `T: Sized` because not all pointer metadata is safe to zero-initialize.
+        // SAFETY: We only wrap a NonNull, so we get a guaranteed null-pointer niche
+        // The allocator is stored in the header, so we could implement this for any allocator.
+        // However, we only do it for the `Global` ZST,
+        // in order to better match `Arc` which stores the allocator inline.
+        //
+        // Note that we cannot implement bytemuck::NoUninit,
+        // as that expressly forbids implementations for pointer types
+        unsafe impl<T> bytemuck::ZeroableInOption for $pointer<T> {}
     };
     (unsafe impl<$primary:ident: ?Sized + $primary_bound:ident, $alloc:ident: Allocator> SmartPointer for $pointer:ident {}) => {
         smart_pointer! {
