@@ -28,19 +28,13 @@ use alloc as allocator_api;
 use allocator_api2 as allocator_api;
 #[cfg(feature = "nightly-ptr-meta")]
 use core::ptr as ptr_meta;
-#[cfg(feature = "nightly-coerce")]
-use core::{marker::Unsize, ops::CoerceUnsized};
 #[cfg(not(feature = "nightly-ptr-meta"))]
 use ptr_meta_stable as ptr_meta;
 
 #[allow(unused_imports, clippy::disallowed_types, reason = "used for docs")]
 use alloc::sync::Arc;
 use core::alloc::Layout;
-use core::borrow::Borrow;
-use core::cmp;
-use core::error::Error;
-use core::fmt::{Debug, Display, Formatter};
-use core::hash::{Hash, Hasher};
+use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroUsize;
@@ -50,7 +44,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use pointee::{SupportedMetadata, SupportedPointeeInternal, SupportedWeakPointeeInternal};
 use ptr_meta::Pointee;
-use stable_deref_trait::{CloneStableDeref, StableDeref};
+use stable_deref_trait::CloneStableDeref;
 
 use allocator_api::alloc::{Allocator, Global};
 
@@ -61,6 +55,8 @@ mod archery;
 mod runtime;
 #[cfg(feature = "serde")]
 mod serde;
+#[macro_use]
+mod macros;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 
@@ -948,6 +944,22 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Deref for Brc<T, A> {
         unsafe { self.ptr.as_ref() }
     }
 }
+
+smart_pointer! {
+    unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> SmartPointer for Brc {}
+}
+// SAFETY: We are thread safe if T is
+// We need to require T: Send to safely drop from other threads
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Sync
+    for Brc<T, A>
+{
+}
+// SAFETY: We are thread safe if T is
+unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Send
+    for Brc<T, A>
+{
+}
+
 macro_rules! drop_may_dangle {
     (unsafe impl<#[may_dangle] $primary:ident: ?Sized + $primary_bound:ident, $alloc:ident: $alloc_bound:ident> Drop for $target:path {
         $($inner:tt)*
@@ -1388,6 +1400,10 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
         }
     }
 }
+smart_pointer! {
+    unsafe impl<T: ?Sized + SupportedWeakPointee, A: Allocator> SmartPointerBasics for Weak {}
+}
+
 // We might be able to be more conservative with these bounds,
 // but this is what std::sync::Weak does
 // SAFETY: We are careful to be thread-safe
@@ -1536,32 +1552,8 @@ mod pointee {
     }
 }
 
-//
-// smart-pointer boilerplate
-//
-
-impl<T: ?Sized + SupportedPointee + Error, A: Allocator> Error for Brc<T, A> {
-    #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.deref().source()
-    }
-
-    #[allow(deprecated, reason = "delegate")]
-    #[inline]
-    fn description(&self) -> &str {
-        self.deref().description()
-    }
-
-    #[allow(deprecated, reason = "delegate")]
-    #[inline]
-    fn cause(&self) -> Option<&dyn Error> {
-        self.deref().cause()
-    }
-}
 // SAFETY: A Cloned Brc just increments the RC, so memory location is the same
 unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> CloneStableDeref for Brc<T, A> {}
-// SAFETY: A Brc is heap allocated so the memory never moves
-unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> StableDeref for Brc<T, A> {}
 impl<T> From<T> for Brc<T> {
     #[inline]
     fn from(value: T) -> Self {
@@ -1667,136 +1659,5 @@ impl<T> FromIterator<T> for Brc<[T]> {
             // need to buffer
             iter.collect::<Vec<T>>().into()
         }
-    }
-}
-impl<T: ?Sized + SupportedPointee, A: Allocator> Borrow<T> for Brc<T, A> {
-    #[inline]
-    fn borrow(&self) -> &T {
-        self.deref()
-    }
-}
-impl<T: ?Sized + SupportedPointee, A: Allocator> AsRef<T> for Brc<T, A> {
-    #[inline]
-    fn as_ref(&self) -> &T {
-        self.deref()
-    }
-}
-impl<T: ?Sized + SupportedPointee + Debug, A: Allocator> Debug for Brc<T, A> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        Debug::fmt(self.deref(), f)
-    }
-}
-impl<T: ?Sized + SupportedPointee + Display, A: Allocator> Display for Brc<T, A> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        Display::fmt(self.deref(), f)
-    }
-}
-impl<T: ?Sized + SupportedPointee + PartialEq, A: Allocator> PartialEq for Brc<T, A> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.deref() == other.deref()
-    }
-}
-impl<T: ?Sized + SupportedPointee + PartialOrd, A: Allocator> PartialOrd for Brc<T, A> {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.deref().partial_cmp(other.deref())
-    }
-}
-impl<T: ?Sized + SupportedPointee + Ord, A: Allocator> Ord for Brc<T, A> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.deref().cmp(other.deref())
-    }
-}
-impl<T: ?Sized + SupportedPointee + Hash, A: Allocator> Hash for Brc<T, A> {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.deref().hash(state);
-    }
-}
-impl<T: ?Sized + SupportedPointee + Eq, A: Allocator> Eq for Brc<T, A> {}
-impl<T: ?Sized + SupportedPointee, A: Allocator> Unpin for Brc<T, A> {}
-// SAFETY: We are thread safe if T is
-// We need to require T: Send to safely drop from other threads
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Sync
-    for Brc<T, A>
-{
-}
-// SAFETY: We are thread safe if T is
-unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sync> Send
-    for Brc<T, A>
-{
-}
-
-#[cfg(feature = "nightly-coerce")]
-impl<T: ?Sized, U: ?Sized> CoerceUnsized<Brc<U>> for Brc<T>
-where
-    T: Unsize<U> + SupportedPointee,
-    U: SupportedPointee,
-{
-}
-
-#[cfg(feature = "nightly-coerce")]
-impl<T: ?Sized, U: ?Sized> CoerceUnsized<Weak<U>> for Weak<T>
-where
-    T: Unsize<U> + SupportedWeakPointee,
-    U: SupportedWeakPointee,
-{
-}
-
-// SAFETY: Preserves target and provenance in replace_ptr
-unsafe impl<T, U: ?Sized + SupportedPointee> unsize::CoerciblePtr<U> for Brc<T> {
-    type Pointee = T;
-    type Output = Brc<U>;
-
-    #[inline]
-    fn as_sized_ptr(&mut self) -> *mut Self::Pointee {
-        // Use deref to acquire pointer to self
-        // NOTE: Turning this into an &mut T is UB if there is shared ownership
-        core::ptr::from_ref(&**self).cast_mut()
-    }
-
-    #[inline]
-    unsafe fn replace_ptr(self, new: *mut U) -> Self::Output {
-        // SAFETY: Caller has guaranteed that `new` is
-        // just an unsized version of the original
-        //
-        // Ownership is correctly transferred from `self` to result.
-
-        // Provenance transferred into `raw` as per `into_raw`.
-        let raw = Self::into_raw(self).cast_mut();
-        // SAFETY: Provenance merged into `new` as per `replace_ptr`.
-        let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
-        // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
-        unsafe { Brc::from_raw(new) }
-    }
-}
-
-// SAFETY: Preserves target and provenance in replace_ptr
-unsafe impl<T, U: ?Sized + SupportedWeakPointee> unsize::CoerciblePtr<U> for Weak<T> {
-    type Pointee = T;
-    type Output = Weak<U>;
-
-    #[inline]
-    fn as_sized_ptr(&mut self) -> *mut Self::Pointee {
-        // Use deref to acquire pointer to self
-        // NOTE: Turning this into an &mut T is UB if there is shared ownership
-        Weak::as_ptr(&*self).cast_mut()
-    }
-
-    #[inline]
-    unsafe fn replace_ptr(self, new: *mut U) -> Self::Output {
-        // SAFETY: Caller has guaranteed that `new` is
-        // just an unsized version of the original
-        //
-        // Ownership is correctly transferred from `self` to result.
-
-        // Provenance transferred into `raw` as per `into_raw`.
-        let raw = Self::into_raw(self).cast_mut();
-        // SAFETY: Provenance merged into `new` as per `replace_ptr`.
-        let new: *mut U = unsafe { <*mut T as unsize::CoerciblePtr<U>>::replace_ptr(raw, new) };
-        // SAFETY: Provenance transferred as per `from_raw`, originally from `into_raw`
-        unsafe { Weak::from_raw(new) }
     }
 }
