@@ -1210,6 +1210,66 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         }
     }
 
+    /// Get the number of strong references to the underlying object,
+    /// or an error if that cannot be precisely determined.
+    ///
+    /// Returns 0 for the result of [`Weak::new`].
+    ///
+    /// # Errors
+    /// Just like [`Brc::strong_count`], this can return an error
+    /// if the strong count cannot be precisely determined.
+    /// See that function for more details.
+    #[inline]
+    pub fn strong_count(&self) -> Result<usize, ImpreciseRefCountError> {
+        let Some(real) = self.real() else {
+            return Ok(0);
+        };
+        real.header().rc.strong_count()
+    }
+
+    /// Get the number of weak references to the underlying object,
+    /// or an error if that cannot be precisely determined.
+    ///
+    /// Returns 0 for the result of [`Weak::new`].
+    /// Also returns zero if there are no outstanding strong references.
+    ///
+    /// # Accuracy
+    /// This can fail to produce an exact result on a non-biased thread,
+    /// which will result in an [`ImpreciseRefCountError`].
+    ///
+    /// Just like [`std::sync::Weak::weak_count`],
+    /// the result may be off by one in either direction.
+    /// This imprecision will not result in an `Err`.
+    ///
+    /// # Errors
+    /// Just like [`Brc::weak_count`], this will return an error
+    /// if the weak count cannot be precisely determined.
+    /// See that function for more details.
+    pub fn weak_count(&self) -> Result<usize, ImpreciseRefCountError> {
+        let Some(real) = self.real() else {
+            return Ok(0);
+        };
+        // mirrors the impl of std::sync::Weak::weak_Count
+        let weak = real.header().weak_count.load(Ordering::Acquire);
+        match real.header().rc.strong_count() {
+            Ok(0) => Ok(0),
+            Err(e @ ImpreciseRefCountError { lower_bound: 0 }) => {
+                // cannot precisely determine whether strong count is zero,
+                // so we cannot know whether we should return zero
+                Err(e.clone())
+            }
+            Ok(1..) | Err(ImpreciseRefCountError { lower_bound: 1.. }) => {
+                // a nonzero strong count means there is a nonzero weak count,
+                // due to the weak pointer shared among all strong pointers.
+                // This shared weak pointer is an implementation detail
+                // which does not correspond to a user-visible `Weak`.
+                // As such, it should be subtracted out from the total.
+                #[expect(clippy::missing_panics_doc, reason = "internal error")]
+                Ok(weak.checked_sub(1).expect("strong without weak") as usize)
+            }
+        }
+    }
+
     /// Return a [`WeakReal`] corresponding to an actual allocation,
     /// or `None` if this is the reserved value from [`Self::new`].
     #[inline]

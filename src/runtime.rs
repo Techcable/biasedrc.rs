@@ -34,7 +34,7 @@ pub enum BiasedCountError {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("Imprecise reference count due to biased thread (lower bound is {lower_bound})")]
 pub struct ImpreciseRefCountError {
-    lower_bound: usize,
+    pub(crate) lower_bound: usize,
 }
 
 /// The result of calling [`RawBrcHeader::increment_strong_unless_zero`]
