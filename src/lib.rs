@@ -45,6 +45,7 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroUsize;
 use core::ops::Deref;
+use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use pointee::{SupportedMetadata, SupportedPointeeInternal, SupportedWeakPointeeInternal};
@@ -241,6 +242,12 @@ impl<T> Brc<T> {
             )
         }
     }
+
+    /// Constructs a `Pin<Brc<T>>`.
+    #[inline]
+    pub fn pin(value: T) -> Pin<Self> {
+        Brc::pin_in(value, Global)
+    }
 }
 impl<T, A: Allocator> Brc<T, A> {
     /// Construct a new [`Brc`] with the specified value,
@@ -314,6 +321,14 @@ impl<T, A: Allocator> Brc<T, A> {
     #[inline]
     pub fn into_inner(this: Self) -> Option<T> {
         Self::try_unwrap(this).ok()
+    }
+
+    /// Constructs a `Pin<Brc<T>>` using the specified allocator.
+    #[inline]
+    pub fn pin_in(data: T, alloc: A) -> Pin<Self> {
+        let res = Brc::new_in(data, alloc);
+        // SAFETY: We have appropriate Deref & Drop impls
+        unsafe { Pin::new_unchecked(res) }
     }
 }
 impl<T, A: Allocator> Brc<[T], A> {
