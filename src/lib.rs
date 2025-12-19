@@ -1070,6 +1070,48 @@ pub trait SupportedPointee: SupportedPointeeInternal {}
 #[doc(hidden)]
 pub trait SupportedWeakPointee: SupportedPointee + SupportedWeakPointeeInternal {}
 
+/// A [`Weak`] which is not the dummy reserved value, and so is "real."
+#[derive(bytemuck::TransparentWrapper)]
+#[repr(transparent)]
+struct WeakReal<T: ?Sized + SupportedWeakPointee, A: Allocator>(Weak<T, A>);
+impl<T: ?Sized + SupportedWeakPointee, A: Allocator> WeakReal<T, A> {
+    #[inline]
+    fn value_ptr(&self) -> NonNull<T> {
+        self.0.value_ptr_or_reserved
+    }
+
+    #[inline]
+    fn value_layout(&self) -> Layout {
+        // SAFETY: Value pointer used to be valid,
+        // so we can call Layout::for_Value
+        unsafe { T::layout_for_ptr(self.value_ptr().as_ptr()) }
+    }
+
+    #[inline]
+    fn layout_info(&self) -> LayoutInfo<A> {
+        // SAFETY: Since allocation was successful,
+        // we know that this layout calculation cannot fail
+        unsafe { LayoutInfo::new(self.value_layout()).unwrap_unchecked() }
+    }
+
+    #[inline]
+    fn header_ptr(&self) -> NonNull<BrcHeader<A>> {
+        let layout_info = self.layout_info();
+        // SAFETY: We trust the `header_offset` from the layout info to be valid
+        unsafe {
+            self.value_ptr()
+                .byte_offset(layout_info.header_offset())
+                .cast::<BrcHeader<A>>()
+        }
+    }
+
+    #[inline]
+    fn header(&self) -> &BrcHeader<A> {
+        // SAFETY: We trust the returned pointer to live for &self
+        unsafe { self.header_ptr().as_ref() }
+    }
+}
+
 /// A weak-reference to a [`Brc`].
 ///
 /// Mirrors [`std::sync::Weak`].
@@ -1109,19 +1151,15 @@ impl<T> Weak<T> {
     }
 }
 
-/// Marker returned from [`Weak::value_ptr`] to indicate the reserved value is being used.
-#[derive(Copy, Clone, Debug)]
-struct ReservedWeakValue;
-
 impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
     /// The allocator that the weak reference originated from.
     ///
     /// Mirrors [`Weak::allocator`].
     #[inline]
     pub fn allocator(&self) -> &A {
-        match self.header() {
-            Ok(header) => &header.alloc,
-            Err(ReservedWeakValue) => {
+        match self.real() {
+            Some(real) => &real.header().alloc,
+            None => {
                 const GLOBAL_REF: &Global = &Global;
                 // SAFETY: The reserved value must use the global allocator
                 unsafe { &*core::ptr::from_ref(GLOBAL_REF).cast::<A>() }
@@ -1129,46 +1167,20 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         }
     }
 
+    /// Return a [`WeakReal`] corresponding to an actual allocation,
+    /// or `None` if this is the reserved value from [`Self::new`].
     #[inline]
-    fn value_ptr(&self) -> Result<NonNull<T>, ReservedWeakValue> {
+    fn real(&self) -> Option<&'_ WeakReal<T, A>> {
         if self.value_ptr_or_reserved.addr() != NonZeroUsize::MAX {
+            debug_assert!(
+                self.value_ptr_or_reserved.addr().get().is_multiple_of(2),
+                "UB: non-reserved pointer inappropriately aligned"
+            );
             // we know its not reserved
-            Ok(self.value_ptr_or_reserved)
+            Some(bytemuck::TransparentWrapper::wrap_ref(self))
         } else {
-            Err(ReservedWeakValue)
+            None
         }
-    }
-
-    #[inline]
-    fn value_layout(&self) -> Result<Layout, ReservedWeakValue> {
-        // SAFETY: Value pointer used to be valid,
-        // so we can call Layout::for_Value
-        Ok(unsafe { T::layout_for_ptr(self.value_ptr()?.as_ptr()) })
-    }
-
-    #[inline]
-    fn layout_info(&self) -> Result<LayoutInfo<A>, ReservedWeakValue> {
-        let value_layout = self.value_layout()?;
-        // SAFETY: Since allocation was successful,
-        // we know that this layout calculation cannot fail
-        Ok(unsafe { LayoutInfo::new(value_layout).unwrap_unchecked() })
-    }
-
-    #[inline]
-    fn header_ptr(&self) -> Result<NonNull<BrcHeader<A>>, ReservedWeakValue> {
-        let layout_info = self.layout_info()?;
-        // SAFETY: We trust the `header_offset` from the layout info to be valid
-        Ok(unsafe {
-            self.value_ptr()?
-                .byte_offset(layout_info.header_offset())
-                .cast::<BrcHeader<A>>()
-        })
-    }
-
-    #[inline]
-    fn header(&self) -> Result<&BrcHeader<A>, ReservedWeakValue> {
-        // SAFETY: We trust the returned pointer to live for &self
-        Ok(unsafe { self.header_ptr()?.as_ref() })
     }
 
     /// Upgrade to an owned reference,
@@ -1176,10 +1188,10 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
     ///
     /// Mirrors [`std::sync::Weak::upgrade`].
     #[inline]
-    #[expect(clippy::missing_panics_doc, reason = "should never panic")]
     pub fn upgrade(&self) -> Option<Brc<T, A>> {
-        let value_ptr = self.value_ptr().ok()?;
-        let header = self.header().unwrap();
+        let this = self.real()?;
+        let value_ptr = this.value_ptr();
+        let header = this.header();
         match header.rc.increment_strong_unless_zero() {
             Ok(()) => {
                 // SAFETY: Success of increment_strong means we have an owned references
@@ -1228,12 +1240,10 @@ drop_may_dangle! {
 unsafe impl<#[may_dangle] T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
     #[inline]
     fn drop(&mut self) {
-        if self.value_ptr().is_ok() {
-            let layout_info = self.layout_info().unwrap();
-            let header_ptr = self.header_ptr().unwrap();
+        if let Some(this) = self.real() {
             // SAFETY: Our existence implies we own a weak reference
             unsafe {
-                BrcHeader::drop_weak(header_ptr.as_ptr(), layout_info);
+                BrcHeader::drop_weak(this.header_ptr().as_ptr(), this.layout_info());
             }
         }
     }
@@ -1242,8 +1252,9 @@ unsafe impl<#[may_dangle] T: ?Sized + SupportedWeakPointee, A: Allocator> Drop f
 impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
     #[inline]
     fn clone(&self) -> Self {
-        match self.header() {
-            Ok(header) => {
+        match self.real() {
+            Some(real) => {
+                let header = real.header();
                 // cannot possibly be locked as justified by std::sync::Weak::clone
                 let old_count = header.weak_count.fetch_add(1, Ordering::AcqRel);
                 if old_count > WEAK_OVERFLOW_THRESHOLD {
@@ -1254,7 +1265,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
                     value_ptr_or_reserved: self.value_ptr_or_reserved,
                 }
             }
-            Err(ReservedWeakValue) => Weak {
+            None => Weak {
                 alloc_marker: PhantomData,
                 value_ptr_or_reserved: self.value_ptr_or_reserved,
             },
