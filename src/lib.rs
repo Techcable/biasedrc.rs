@@ -48,21 +48,19 @@ use stable_deref_trait::CloneStableDeref;
 
 use allocator_api::alloc::{Allocator, Global};
 
-#[cfg(feature = "arc-swap")]
-mod arc_swap;
-#[cfg(feature = "archery")]
-mod archery;
 mod runtime;
-#[cfg(feature = "serde")]
-mod serde;
+mod third_party;
 #[macro_use]
 mod macros;
 
 use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
 
-#[cfg(feature = "archery")]
-pub use self::archery::BrcK;
 pub use crate::runtime::{BiasedCountError, ImpreciseRefCountError, collect, collect_force};
+#[allow(
+    unused_imports,
+    reason = "if all features are disabled, may not include any items"
+)]
+pub use crate::third_party::*;
 
 const WEAK_LOCKED_COUNT: u32 = u32::MAX;
 /// If the weak reference passes this point,
