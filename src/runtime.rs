@@ -129,10 +129,15 @@ impl RawBrcHeader {
 
     /// Attempt to determine the number of strong references,
     /// returning an error if it cannot be precisely determined.
+    ///
+    /// The specified [`Ordering`] determines the memory-ordering of the load of the shared word.
     #[inline]
-    pub fn strong_count(&self) -> Result<usize, ImpreciseRefCountError> {
+    pub fn strong_count(
+        &self,
+        shared_load_order: Ordering,
+    ) -> Result<usize, ImpreciseRefCountError> {
         let this_thread_id = LocalThreadState::existing_short_id().ok();
-        let shared_word = SharedWord::from_raw(self.shared_word.load(Ordering::Acquire));
+        let shared_word = SharedWord::from_raw(self.shared_word.load(shared_load_order));
         let biased_word = BiasedWord::from_raw(self.biased_word.load(Ordering::Relaxed));
         if shared_word.merged {
             let res = shared_word.shared_count.value();
@@ -209,7 +214,7 @@ impl RawBrcHeader {
     /// If internal invariants are invalidated, this may panic.
     #[inline]
     pub fn is_unique(&self) -> bool {
-        match self.strong_count() {
+        match self.strong_count(Ordering::Acquire) {
             Ok(count) => count == 1,
             Err(ImpreciseRefCountError { .. }) => false, // be conservative
         }

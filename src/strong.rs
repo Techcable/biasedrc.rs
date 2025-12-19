@@ -340,7 +340,8 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// and the true reference count cannot be determined.
     #[inline]
     pub fn strong_count(this: &Self) -> Result<usize, ImpreciseRefCountError> {
-        this.header().rc.strong_count()
+        // Arc::strong_count uses a Relaxed ordering here
+        this.header().rc.strong_count(Ordering::Relaxed)
     }
 
     /// Returns the number of weak pointers to the object,

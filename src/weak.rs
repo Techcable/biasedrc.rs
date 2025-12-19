@@ -120,7 +120,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         let Some(real) = self.real() else {
             return Ok(0);
         };
-        real.header().rc.strong_count()
+        real.header().rc.strong_count(Ordering::Relaxed)
     }
 
     /// Get the number of weak references to the underlying object,
@@ -145,9 +145,9 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         let Some(real) = self.real() else {
             return Ok(0);
         };
-        // mirrors the impl of std::sync::Weak::weak_Count
+        // mirrors the impl of std::sync::Weak::weak_count
         let weak = real.header().weak_count.load(Ordering::Acquire);
-        match real.header().rc.strong_count() {
+        match real.header().rc.strong_count(Ordering::Relaxed) {
             Ok(0) => Ok(0),
             Err(e @ ImpreciseRefCountError { lower_bound: 0 }) => {
                 // cannot precisely determine whether strong count is zero,
