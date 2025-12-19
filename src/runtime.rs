@@ -938,9 +938,7 @@ pub(crate) mod fatal_errors {
             #[cold]
             #[inline(never)]
             pub(crate) fn $name() -> ! {
-                nounwind::abort_unwind(|| {
-                    panic!(concat!("biasedrc: ", $fmt) $(, $($arg)*)*);
-                })
+                nounwind::panic_nounwind!(concat!("biasedrc: ", $fmt) $(, $($arg)*)*)
             }
         };
     }
@@ -966,9 +964,7 @@ mod undefined_behavior {
             #[cold]
             #[inline(never)]
             pub(crate) fn $name() -> ! {
-                nounwind::abort_unwind(|| {
-                    panic!(concat!("biasedrc encountered undefined behavior: ", $fmt) $(, $($arg)*)*);
-                })
+                nounwind::panic_nounwind!(concat!("biasedrc encountered undefined behavior: ", $fmt) $(, $($arg)*)*)
             }
         };
     }
