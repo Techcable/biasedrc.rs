@@ -21,6 +21,7 @@
 )]
 
 extern crate alloc;
+extern crate core;
 
 #[cfg(not(feature = "std"))]
 compile_error!("The standard library is required to use `biasedrc`");
@@ -44,6 +45,8 @@ mod pointee;
 mod runtime;
 mod strong;
 mod third_party;
+mod uninit;
+mod unique;
 mod weak;
 
 pub use crate::pointee::{SupportedPointee, SupportedWeakPointee};
@@ -53,4 +56,6 @@ pub use crate::runtime::{
 pub use crate::strong::Brc;
 #[allow(unused_imports, reason = "may be nop if no features are enabled")]
 pub use crate::third_party::*;
+pub use crate::uninit::UniqueUninitBrc;
+pub use crate::unique::UniqueBrc;
 pub use crate::weak::Weak;

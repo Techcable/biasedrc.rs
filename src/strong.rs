@@ -6,20 +6,22 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 use stable_deref_trait::CloneStableDeref;
 
-use crate::allocator_api::alloc::{Allocator, Global};
-use crate::layout::{BrcHeader, LayoutInfo, WEAK_LOCKED_COUNT, WEAK_OVERFLOW_THRESHOLD};
+use crate::UniqueBrc;
+use crate::allocator_api::alloc::{AllocError, Allocator, Global};
+use crate::layout::{
+    BrcHeader, LayoutInfo, PartialAlloc, WEAK_LOCKED_COUNT, WEAK_OVERFLOW_THRESHOLD,
+};
 use crate::pointee::SupportedMetadata;
 use crate::ptr_meta::{self, Pointee};
 use crate::runtime::{
-    DropInfo, ErasedDestructorContext, MayPanic, NeverPanic, RawBrcHeader, UnwindPolicy,
-    collect_implicit,
+    self, DropInfo, ErasedDestructorContext, MayPanic, NeverPanic, RawBrcHeader, UnwindPolicy,
 };
+use crate::weak::WeakDropGuard;
 use crate::{
-    BiasedCountError, ImpreciseRefCountError, SupportedPointee, SupportedWeakPointee, Weak,
-    collect, runtime,
+    BiasedCountError, ImpreciseRefCountError, SupportedPointee, SupportedWeakPointee, Weak, collect,
 };
 
 mod conversions;
@@ -88,6 +90,18 @@ impl<T> Brc<T> {
                 Global,
             )
         }
+    }
+    /// Construct a self-referential [`Brc`] in the style of [`Arc::new_cyclic`].
+    ///
+    /// # Implementation
+    /// This function is implemented with entirely safe code,
+    /// using the public API provided by [`crate::UniqueBrc`] and [`crate::UniqueUninitBrc`].
+    #[inline]
+    pub fn new_cyclic(func: impl FnOnce(&Weak<T>) -> T) -> Self {
+        let uninit = crate::UniqueUninitBrc::new();
+        let result = uninit.with_weak_ref(func);
+        let unique = uninit.write(result);
+        UniqueBrc::into_shared(unique)
     }
 
     /// Allocates a `Pin<Brc<T>>`, as if wrapping [`Self::new`] in a [`Pin`].
@@ -343,72 +357,39 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         //
         // However, there may be a performance advantage to merging the checks together.
         // At some point, we should investigate and benchmark the effect of that change.
-        collect_implicit();
+        runtime::collect_implicit();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
-        struct CleanupGuard<'a, A: Allocator> {
-            ptr: NonNull<u8>,
-            layout: Layout,
-            alloc: &'a A,
-        }
+        let allocated = match crate::layout::begin_alloc_in(layout, alloc) {
+            Ok(success) => success,
+            Err(AllocError) => alloc::alloc::handle_alloc_error(layout.full_layout()),
+        };
+        let value_ptr = ptr_meta::from_raw_parts_mut(allocated.value_ptr().as_ptr(), meta);
+        struct CleanupGuard<'a, A: Allocator>(&'a PartialAlloc<A>);
         impl<A: Allocator> Drop for CleanupGuard<'_, A> {
-            #[inline(always)] // Unfortunately, core::ptr::drop_in_place still might not be inlined
             fn drop(&mut self) {
-                // SAFETY: We know the pointer is valid since we just allocated it
-                // We are careful to forget the guard if we are successful
-                unsafe { self.alloc.deallocate(self.ptr, self.layout) }
+                // SAFETY: Will not be used again.
+                unsafe { self.0.dealloc() }
             }
         }
-        let Ok(allocated) = alloc.allocate(layout.full_layout) else {
-            alloc::alloc::handle_alloc_error(layout.full_layout);
-        };
         // SAFETY: It is perfectly safe for P::MAY_PANIC to be wrong.
         // In that case, we simply leak memory.
         let guard = if U::MAY_UNWIND {
-            Some(CleanupGuard {
-                ptr: allocated.cast(),
-                layout: layout.full_layout,
-                alloc: &alloc,
-            })
+            Some(CleanupGuard(&allocated))
         } else {
             None
         };
-        const {
-            assert!(core::mem::offset_of!(BrcHeader<A>, strong) == 0);
-        }
-        // SAFETY: Memory is newly allocated so it is known to be valid
-        // The RawBrcHeader is pinned immediately after it is created
-        // we just verified above that the field offset is zero
-        unsafe {
-            allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
-        }
-        // SAFETY: Newly allocated memory is valid
-        unsafe {
-            allocated
-                .byte_add(core::mem::offset_of!(BrcHeader<A>, weak_count))
-                .cast::<AtomicU32>()
-                // there is a single weak reference shared among all strong references
-                .write(AtomicU32::new(1));
-        }
-        // SAFETY: We trust the LayoutInfo to have the correct offset
-        let value_ptr_addr = unsafe {
-            allocated
-                .as_ptr()
-                .byte_offset(layout.value_offset)
-                .cast::<()>()
-        };
-        let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
         func(value_ptr);
         core::mem::forget(guard);
-        // The guard no longer borrows the allocator, so now we can move it to the header.
-        // SAFETY: Know that the allocated memory starts with a BrcHeader
+        // SAFETY: We know we can initialize the strong count, as it was not used before
+        // A relaxed ordering is fine since we have not exposed the pointer yet
         unsafe {
             allocated
-                .byte_add(core::mem::offset_of!(BrcHeader<A>, alloc))
-                .cast::<A>()
-                .write(alloc);
+                .header_ptr()
+                .as_ref()
+                .strong
+                .init(Ordering::Relaxed);
         }
-        // SAFETY: Allocated pointer is valid and never null
-        // and the header is fully initialized
+        // SAFETY: Header, strong count, and value are all fully initialized
         unsafe { Self::from_raw(value_ptr) }
     }
 
@@ -784,7 +765,10 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     }
 
     #[inline]
-    unsafe fn header_ptr_for(ptr: NonNull<T>, layout: LayoutInfo<A>) -> NonNull<BrcHeader<A>> {
+    pub(crate) unsafe fn header_ptr_for(
+        ptr: NonNull<T>,
+        layout: LayoutInfo<A>,
+    ) -> NonNull<BrcHeader<A>> {
         let header_offset = layout.header_offset();
         // SAFETY: Caller guarantees pointer is spatially valid
         unsafe {
@@ -884,7 +868,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         let value: &T = this.deref();
         let context = DropContext::<T, A> {
             metadata: ptr_meta::metadata(value),
-            value_offset: this.layout().value_offset,
+            value_offset: this.layout().value_offset(),
             marker: PhantomData,
         };
         // SAFETY: Pointer is spatially valid
@@ -984,35 +968,14 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> DropInfo for DropContext<T, A> 
             // SAFETY: We know that the context is valid
             unsafe { <T::Metadata as SupportedMetadata>::from_context(ctx) },
         );
-        /// Guard to drop the weak reference shared by all strong references.
-        ///
-        /// This guard ensures that the underlying memory is freed,
-        /// even if the destructor of `T` panics.
-        ///
-        /// We can not use a real [`Weak`] pointer directly as that has stricter bounds on `T`
-        /// in order to do the layout calculation.
-        struct WeakDropGuard<A: Allocator> {
-            header_ptr: NonNull<BrcHeader<A>>,
-            layout_info: LayoutInfo<A>,
-        }
-        impl<A: Allocator> Drop for WeakDropGuard<A> {
-            #[inline]
-            fn drop(&mut self) {
-                // SAFETY: Safe to drop because we are last strong reference
-                unsafe {
-                    BrcHeader::<A>::drop_weak(self.header_ptr.cast().as_ptr(), self.layout_info);
-                }
-            }
-        }
-        // SAFETY: Valid to get a &T since the valuehas not been dropped yet.
+        // SAFETY: Valid to get a &T since the value has not been dropped yet.
         // We also know that the layout will not overflow as allocation already succeeded.
         // This violates stacked borrow but works fine for tree borrows.
         let layout_info = unsafe { LayoutInfo::<A>::for_value(&*value) };
-        debug_assert_eq!(layout_info.value_offset, value_offset);
-        let weak_guard = WeakDropGuard {
-            header_ptr: header_ptr.cast(),
-            layout_info,
-        };
+        debug_assert_eq!(layout_info.value_offset(), value_offset);
+        // SAFETY: This corresponds to the weak reference shared among all strong references
+        // This should be dropped either at the end of the scope or if T::drop panics.
+        let weak_guard = unsafe { WeakDropGuard::new(header_ptr.cast(), layout_info) };
         if core::mem::needs_drop::<T>() {
             // SAFETY: Caller guarantees this is not invoked until it is valid to drop
             unsafe { core::ptr::drop_in_place(value) }

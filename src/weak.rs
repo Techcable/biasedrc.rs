@@ -306,3 +306,68 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Debug for Weak<T, A> {
         f.write_str("(Weak)")
     }
 }
+
+/// Guard to call [`BrcHeader::drop_weak`] in the destructor.
+///
+/// This guard can ensure that the underlying memory is freed,
+/// even if the destructor of `T` panics.
+///
+/// This can be better than a real [`Weak`] pointer in some situations,
+/// as it doesn't require a [`SupportedWeakPointee`] bound.
+/// However, it means the layout information must be passed to the constructor.
+///
+/// It is not necessary to depend on `T`,
+/// as we already have the layout information and don't drop `T`.
+pub(crate) struct WeakDropGuard<A: Allocator> {
+    header_ptr: NonNull<BrcHeader<A>>,
+    layout_info: LayoutInfo<A>,
+}
+impl<A: Allocator> WeakDropGuard<A> {
+    #[inline]
+    pub fn header_ptr(&self) -> NonNull<BrcHeader<A>> {
+        self.header_ptr
+    }
+
+    /// Create a new [`WeakDropGuard`] from the specified header pointer and layout info.
+    ///
+    /// This effectively consumes ownership of a weak reference
+    /// in a manner similar to [`crate::Weak::from_raw`].
+    ///
+    /// # Safety
+    /// The header pointer must point to a valid object,
+    /// with the matching layout information
+    ///
+    /// Must be valid to invoke [`BrcHeader::drop_weak`] when the destructor is called.
+    /// In other words, there must be a weak reference to take ownership of.
+    #[inline]
+    pub unsafe fn new(header_ptr: NonNull<BrcHeader<A>>, layout_info: LayoutInfo<A>) -> Self {
+        WeakDropGuard {
+            header_ptr,
+            layout_info,
+        }
+    }
+
+    /// Return a pointer to the value, based on [`Self::layout_info`].
+    ///
+    /// # Safety
+    /// This is safe, as layout information is trusted by construction.
+    #[inline]
+    pub fn value_ptr(&self) -> NonNull<()> {
+        // SAFETY: We trust the LayoutInfo to give an accurate offset,
+        // and we know allocated memory matches it
+        unsafe {
+            self.header_ptr()
+                .byte_offset(self.layout_info.value_offset())
+                .cast::<()>()
+        }
+    }
+}
+impl<A: Allocator> Drop for WeakDropGuard<A> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: Safe to drop because that is guaranteed by construction
+        unsafe {
+            BrcHeader::<A>::drop_weak(self.header_ptr.cast().as_ptr(), self.layout_info);
+        }
+    }
+}

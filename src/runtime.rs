@@ -110,15 +110,48 @@ impl RawBrcHeader {
     /// This is true regardless of what [`std::mem::needs_drop`] claims.
     pub const NEEDS_DROP: bool = false;
 
-    /// Initialize the header, biasing towards the current thread.
+    /// Create a new header, whose strong reference count is at zero
+    /// and is not biased towards any particular thread.
+    ///
+    /// Along with `weak_count = 1`,
+    /// the strong count for [`crate::UniqueBrc`] and [`crate::UniqueUninitBrc`] must be kept in this state
+    /// to maintain their uniqueness.
+    /// This is because an uninitialized strong count prevents weak references from being upgraded
+    /// to strong references.
     ///
     /// # Safety
-    /// The resulting header must be pinned in-memory before it is ever used.
+    /// This header must not be exposed to the [runtime](crate::runtime)
+    /// until it is [initialized](Self::init).
     ///
     /// # Panics
-    /// This function will never unwind, although it may abort.
+    /// This function will never panic.
     #[inline]
-    pub unsafe fn init() -> Self {
+    pub const unsafe fn new_uninit() -> Self {
+        RawBrcHeader {
+            shared_word: AtomicUsize::new(SharedWord::UNINIT.to_raw()),
+            biased_word: AtomicU32::new(BiasedWord::UNOWNED.to_raw()),
+            marker: PhantomPinned,
+        }
+    }
+
+    /// Initialize the header, creating a strong reference biased towards the current thread.
+    ///
+    /// This allows the header to be exposed to the runtime and participate in biasing normally.
+    /// The ordering controls the memory ordering of writing to the shared word.
+    ///
+    /// # Safety
+    /// Header must have been [uninitialized](Self::new_uninit) before calling this method.
+    ///
+    /// The resulting header must be pinned in-memory before it is observed by the runtime.
+    ///
+    /// # Panics
+    /// This function will never unwind.
+    /// However, it may abort if internal invariants are violated.
+    #[inline]
+    pub unsafe fn init(&self, write_order: Ordering) {
+        if cfg!(debug_assertions) && !self.is_strong_uninit(Ordering::Relaxed) {
+            undefined_behavior::init_raw_header_already_init();
+        }
         let this_id = match LocalThreadState::existing_short_id() {
             Ok(short_id) => Some(short_id),
             Err(LocalThreadAccessError::Dead | LocalThreadAccessError::IdOverflow(_)) => {
@@ -131,39 +164,51 @@ impl RawBrcHeader {
                 LocalThreadState::init_tid()
             }
         };
-        match this_id {
-            None => RawBrcHeader {
-                shared_word: AtomicUsize::new(
-                    SharedWord {
-                        shared_count: SharedCount::new(1),
-                        // mark as merged
-                        merged: true,
-                        queued: false,
-                    }
-                    .to_raw(),
-                ),
-                biased_word: AtomicU32::new(BiasedWord::UNOWNED.to_raw()),
-                marker: PhantomPinned,
-            },
-            Some(this_id) => RawBrcHeader {
-                biased_word: AtomicU32::new(
-                    BiasedWord {
-                        biased_count: BiasedCount::new(1),
-                        owner_id: Some(this_id),
-                    }
-                    .to_raw(),
-                ),
-                shared_word: AtomicUsize::new(
-                    SharedWord {
-                        queued: false,
-                        merged: false,
-                        shared_count: SharedCount::new(0),
-                    }
-                    .to_raw(),
-                ),
-                marker: PhantomPinned,
-            },
-        }
+        let (biased_word, shared_word) = match this_id {
+            None => (
+                BiasedWord::UNOWNED,
+                SharedWord {
+                    shared_count: SharedCount::new(1),
+                    // mark as merged
+                    merged: true,
+                    queued: false,
+                },
+            ),
+            Some(this_id) => (
+                BiasedWord {
+                    biased_count: BiasedCount::new(1),
+                    owner_id: Some(this_id),
+                },
+                SharedWord {
+                    queued: false,
+                    merged: false,
+                    shared_count: SharedCount::new(0),
+                },
+            ),
+        };
+        // a relaxed ordering is always fine here, since we are the biased thread
+        self.biased_word
+            .store(biased_word.to_raw(), Ordering::Relaxed);
+        self.shared_word.store(shared_word.to_raw(), write_order);
+    }
+
+    /// Return true if the header is unbiased.
+    #[inline]
+    pub fn is_unbiased(&self) -> bool {
+        self.biased_word.load(Ordering::Relaxed) == BiasedWord::UNOWNED.to_raw()
+    }
+
+    /// Return true if the header's strong counts are definitely [uninit](Self::new_uninit).
+    ///
+    /// This means the header is unbiased and the shared state is [`SharedWord::UNINIT`].
+    /// the shared count is marked as "merged",
+    ///
+    /// May have false positives if the header becomes initialized,
+    /// then becomes unbiased, and then transitions to a zero shared reference count.
+    /// However, there are no false negatives.
+    #[inline]
+    pub fn is_strong_uninit(&self, order: Ordering) -> bool {
+        self.is_unbiased() && self.shared_word.load(order) == SharedWord::UNINIT.to_raw()
     }
 
     /// Attempt to determine the number of strong references,
@@ -727,14 +772,15 @@ impl BiasedWord {
         biased_count: BiasedCount::ZERO,
     };
     #[inline]
-    fn to_raw(self) -> u32 {
+    const fn to_raw(self) -> u32 {
         const {
             assert!(ShortThreadId::BITS as usize + BiasedCount::BITS == Self::BITS);
         }
-        ((self.biased_count.value()) << ShortThreadId::BITS)
-            | (self
-                .owner_id
-                .map_or(0, |value| value.value().value() as u32))
+        let owner_bits = match self.owner_id {
+            Some(value) => value.value().value() as u32,
+            None => 0,
+        };
+        ((self.biased_count.value()) << ShortThreadId::BITS) | owner_bits
     }
     #[inline]
     fn from_raw(raw: u32) -> Self {
@@ -815,6 +861,14 @@ struct SharedWord {
     queued: bool,
 }
 impl SharedWord {
+    /// The state of the shared word after [`RawBrcHeader::new_uninit`].
+    ///
+    /// This is marked as merged, since the biased count should be unowned.
+    const UNINIT: SharedWord = SharedWord {
+        shared_count: SharedCount::new(0),
+        queued: false,
+        merged: true,
+    };
     /// The number of bits this value takes when packed with [`Self::to_raw`].
     ///
     /// This is not necessarily equal to `size_of::<Self>() * 8`,
@@ -835,7 +889,7 @@ impl SharedWord {
     /// This is safe enough we don't have to worry about it.
     const OVERFLOW_THRESHOLD: SharedCount = SharedCount::new(SharedCount::MAX.value() / 2);
     #[inline]
-    fn to_raw(self) -> usize {
+    const fn to_raw(self) -> usize {
         const {
             assert!(usize::BITS as usize == Self::BITS);
         }
@@ -1038,7 +1092,7 @@ pub(crate) mod fatal_errors {
 /// This does not ever call [`core::hint::unreachable_unchecked`],
 /// but instead aborts with a descriptive error message.
 #[cfg_attr(not(debug_assertions), allow(unused))]
-mod undefined_behavior {
+pub(crate) mod undefined_behavior {
     macro_rules! undefined_behavior {
         ($name:ident => $fmt:expr $(, $($arg:tt)*)?) => {
             #[cold]
@@ -1055,4 +1109,7 @@ mod undefined_behavior {
     undefined_behavior!(owner_undefined_state => "Biased thread has undefined state, but still owns objects");
     undefined_behavior!(strong_count_arith_overflow => "Computing the strong_count either overflowed (impossible) or underflowed (UB) a counter");
     undefined_behavior!(biased_count_zero_and_owned => "Reference is biased towards a particular thread, but has a zero refcount");
+    undefined_behavior!(unique_nonzero_strong => "A UniqueBrc/UniqueUninitBrc has nonzero strong count (should be uninit)");
+    undefined_behavior!(unique_weak_locked => "A UniqueBrc/UniqueUninitBrc has a locked weak reference");
+    undefined_behavior!(init_raw_header_already_init => "Cannot initialize RawBrcHeader, it is either biased or has an initialized shared word");
 }

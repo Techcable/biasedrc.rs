@@ -189,3 +189,15 @@ fn weak_slices() {
     let weak = Brc::downgrade(&strong);
     assert_eq!(Some(strong), Weak::upgrade(&weak));
 }
+
+#[test]
+fn new_cyclic() {
+    struct Cycle {
+        inner: Weak<Cycle>,
+    }
+    let res = Brc::new_cyclic(|inner| Cycle {
+        inner: inner.clone(),
+    });
+    let inner = Weak::upgrade(&res.inner).unwrap();
+    assert!(Brc::ptr_eq(&res, &inner));
+}
