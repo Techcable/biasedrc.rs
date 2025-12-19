@@ -978,8 +978,14 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
 /// A [`Brc`] is just a [`NonNull`] pointer, so `Option<Brc>` can be safely zero-initialized.
 ///
 /// This requires `T: Sized` because not all pointer metadata is safe to zero-initialize.
-// SAFETY: We only wrap a NonNull (the allocator is stored in the header)
-unsafe impl<T, A: Allocator> bytemuck::ZeroableInOption for Brc<T, A> {}
+// SAFETY: We only wrap a NonNull, so we get a guaranteed null-pointer niche
+// The allocator is stored in the header, so we could implement this for any allocator.
+// However, we only do it for the `Global` ZST,
+// in order to better match `Arc` which stores the allocator inline.
+//
+// Note that we cannot implement bytemuck::NoUninit,
+// as that expressly forbids implementations for pointer types
+unsafe impl<T> bytemuck::ZeroableInOption for Brc<T> {}
 
 struct DropContext<T: ?Sized + SupportedPointee, A: Allocator> {
     metadata: <T as Pointee>::Metadata,
