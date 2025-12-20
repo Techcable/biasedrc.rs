@@ -21,7 +21,7 @@ pub const WEAK_OVERFLOW_THRESHOLD: u32 = u32::MAX / 2;
 /// This is `#[repr(C)]` because [`Brc::alloc_with_in`] initializes it field-by-field.
 #[repr(C)]
 pub struct BrcHeader<A: Allocator> {
-    pub rc: RawBrcHeader,
+    pub strong: RawBrcHeader,
     /// The weak reference count.
     ///
     /// May be [`WEAK_LOCKED_COUNT`] to indicate that it is "locked",

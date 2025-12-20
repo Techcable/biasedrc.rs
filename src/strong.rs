@@ -287,7 +287,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             alloc: Some(alloc),
         };
         const {
-            assert!(core::mem::offset_of!(BrcHeader<A>, rc) == 0);
+            assert!(core::mem::offset_of!(BrcHeader<A>, strong) == 0);
         }
         // SAFETY: Memory is newly allocated so it is known to be valid
         // The RawBrcHeader is pinned immediately after it is created
@@ -341,7 +341,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     #[inline]
     pub fn strong_count(this: &Self) -> Result<usize, ImpreciseRefCountError> {
         // Arc::strong_count uses a Relaxed ordering here
-        this.header().rc.strong_count(Ordering::Relaxed)
+        this.header().strong.strong_count(Ordering::Relaxed)
     }
 
     /// Returns the number of weak pointers to the object,
@@ -371,7 +371,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// See [`Self::strong_count`] for details.
     #[inline]
     pub fn is_unique(this: &Self) -> bool {
-        if this.header().rc.is_definitely_not_unique() {
+        if this.header().strong.is_definitely_not_unique() {
             // return false quickly if we are definitely not the biased thread
             return false;
         }
@@ -383,7 +383,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             .compare_exchange(1, WEAK_LOCKED_COUNT, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            let actually_unique = this.header().rc.is_unique();
+            let actually_unique = this.header().strong.is_unique();
             // now release the lock on the weak reference count
             this.header().weak_count.store(1, Ordering::Release);
             actually_unique
@@ -398,7 +398,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// This method is intended only for testing.
     #[doc(hidden)]
     pub fn biased_count(this: &Self) -> Result<usize, BiasedCountError> {
-        this.header().rc.biased_count()
+        this.header().strong.biased_count()
     }
 
     /// Return the shared reference count.
@@ -406,7 +406,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// This method is intended only for testing.
     #[doc(hidden)]
     pub fn shared_count(this: &Self) -> isize {
-        this.header().rc.shared_count()
+        this.header().strong.shared_count()
     }
 
     /// Return the biased and shared reference counts.
@@ -868,7 +868,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// However, it may abort if the reference count overflows or internal state appears corrupted.
     #[inline]
     pub fn clone_no_collect(this: &Self) -> Self {
-        this.header().rc.increment_strong();
+        this.header().strong.increment_strong();
         // SAFETY: Just successfully incremented the refcnt
         unsafe { Brc::from_raw(this.ptr.as_ptr()) }
     }
@@ -897,7 +897,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// Even if this is the biased thread, this still increments the shared count.
     #[inline]
     pub fn clone_shared(this: &Self) -> Self {
-        this.header().rc.increment_strong_shared();
+        this.header().strong.increment_strong_shared();
         // SAFETY: Just incremented the reference count
         unsafe { Brc::from_raw(this.ptr.as_ptr()) }
     }
@@ -918,11 +918,11 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         let header_ptr = unsafe { Self::header_ptr_for(this.ptr, this.layout()).as_ptr() };
         // SAFETY: We own a reference count and the context is valid
         let result =
-            unsafe { RawBrcHeader::decrement_strong(&raw const (*header_ptr).rc, context) };
+            unsafe { RawBrcHeader::decrement_strong(&raw const (*header_ptr).strong, context) };
         if result.should_drop {
             // SAFETY: We trust the drop function to return a valid result
             unsafe {
-                context.dealloc(NonNull::new_unchecked(&raw mut (*header_ptr).rc));
+                context.dealloc(NonNull::new_unchecked(&raw mut (*header_ptr).strong));
             }
         }
     }

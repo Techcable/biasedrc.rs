@@ -120,7 +120,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         let Some(real) = self.real() else {
             return Ok(0);
         };
-        real.header().rc.strong_count(Ordering::Relaxed)
+        real.header().strong.strong_count(Ordering::Relaxed)
     }
 
     /// Get the number of weak references to the underlying object,
@@ -147,7 +147,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         };
         // mirrors the impl of std::sync::Weak::weak_count
         let weak = real.header().weak_count.load(Ordering::Acquire);
-        match real.header().rc.strong_count(Ordering::Relaxed) {
+        match real.header().strong.strong_count(Ordering::Relaxed) {
             Ok(0) => Ok(0),
             Err(e @ ImpreciseRefCountError { lower_bound: 0 }) => {
                 // cannot precisely determine whether strong count is zero,
@@ -191,7 +191,7 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
         let this = self.real()?;
         let value_ptr = this.value_ptr();
         let header = this.header();
-        match header.rc.increment_strong_unless_zero() {
+        match header.strong.increment_strong_unless_zero() {
             Ok(()) => {
                 // SAFETY: Success of increment_strong means we have an owned references
                 unsafe { Some(Brc::from_raw(value_ptr.as_ptr())) }
