@@ -46,7 +46,7 @@ impl<A: Allocator> BrcHeader<A> {
         // The reasoning in Arc::drop/Weak::drop justifies why we can weaken this to Release
         // with an acquire fence afterward.
         // The reasoning in Weak::drop explains why we don't need to check if we are locked
-        if weak_count.fetch_sub(1, Ordering::Acquire) == 1 {
+        if weak_count.fetch_sub(1, Ordering::Release) == 1 {
             // this is not moved into the cold path because
             // it may be possible to fold into the load/store
             atomic::fence(Ordering::Acquire);
