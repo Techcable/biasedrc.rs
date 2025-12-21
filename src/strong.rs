@@ -221,6 +221,8 @@ impl<T, A: Allocator> Brc<[T], A> {
     /// whose length is trusted to be exact.
     ///
     /// The iterator is permitted to panic, both in [`Iterator::next`] and [`Drop`].
+    /// Passing an incorrect [`PanicPolicy`] is perfectly safe,
+    /// for the same reasons as it is in [`Self::alloc_with_in`].
     ///
     /// # Safety
     /// The layout must match the result of [`Layout::array`].
@@ -228,7 +230,7 @@ impl<T, A: Allocator> Brc<[T], A> {
     ///
     /// The iterator must either panic or yield precisely as many elements as its length.
     #[deny(clippy::multiple_unsafe_ops_per_block)]
-    pub(crate) unsafe fn from_iter_exact_trusted_in(
+    pub(crate) unsafe fn from_iter_exact_trusted_in<P: PanicPolicy>(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
         alloc: A,
@@ -243,23 +245,28 @@ impl<T, A: Allocator> Brc<[T], A> {
             }
             impl<T> Drop for PartialDropGuard<T> {
                 fn drop(&mut self) {
-                    if core::mem::needs_drop::<T>() {
-                        let initialized =
-                            core::ptr::slice_from_raw_parts_mut(self.dest, self.initialized_len);
-                        // SAFETY: Trust that `len` items have been initialized
-                        unsafe {
-                            core::ptr::drop_in_place(initialized);
-                        }
+                    let initialized =
+                        core::ptr::slice_from_raw_parts_mut(self.dest, self.initialized_len);
+                    // SAFETY: Trust that `len` items have been initialized
+                    unsafe {
+                        core::ptr::drop_in_place(initialized);
                     }
                 }
             }
-            let mut guard = PartialDropGuard {
-                dest,
-                initialized_len: 0,
+            let mut guard = if P::MAY_PANIC && core::mem::needs_drop::<T>() {
+                Some(PartialDropGuard {
+                    dest,
+                    initialized_len: 0,
+                })
+            } else {
+                None
             };
             for index in 0..len {
-                guard.initialized_len = index;
-                // SAFETY: We trust the length to be exact
+                if let Some(ref mut guard) = guard {
+                    guard.initialized_len = index;
+                }
+                // SAFETY: We trust the length to be exact, so unwrap_unchecked is sound
+                // The next() call is always allowed to panic (PanicPolicy is allowed to lie)
                 let item = unsafe { iter.next().unwrap_unchecked() };
                 // SAFETY: Index is in bounds
                 let slot = unsafe { dest.add(index) };
@@ -270,12 +277,12 @@ impl<T, A: Allocator> Brc<[T], A> {
             // We don't want to do this in the drop function as that could trigger a double-panic
             // This is zero-cost if the iterator has no side effects
             let _ = iter.next();
-            drop(iter); // this is permitted to panic
+            drop(iter); // this is always permitted to panic, as PanicPolicy is allowed to lie
             core::mem::forget(guard); // finished initialization
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
-        unsafe { Brc::alloc_with_in::<MayPanic>(layout, len, do_init, alloc) }
+        unsafe { Brc::alloc_with_in::<P>(layout, len, do_init, alloc) }
     }
 }
 
@@ -283,6 +290,10 @@ impl<T, A: Allocator> Brc<[T], A> {
 ///
 /// Using [`NeverPanic`] can noticeably improve performance,
 /// as discussed in [`Brc::new_in`].
+///
+/// # Safety
+/// The [`Self::MAY_PANIC`] flag is intended as a hint,
+/// and should not be relied upon for memory safety.
 pub(crate) trait PanicPolicy {
     const MAY_PANIC: bool;
 }
@@ -850,14 +861,17 @@ impl<T: Clone> From<&[T]> for Brc<[T]> {
     fn from(src: &[T]) -> Self {
         let layout = Layout::for_value(src);
         // SAFETY: We trust the slice iterator + cloned() to have correct length or panic
-        unsafe { Self::from_iter_exact_trusted_in(layout, src.iter().cloned(), Global) }
+        // It would be nice if we could ask `is_copy::<T>`,
+        // but we unfortunately cannot without specialization.
+        unsafe { Self::from_iter_exact_trusted_in::<MayPanic>(layout, src.iter().cloned(), Global) }
     }
 }
 impl<T> From<Vec<T>> for Brc<[T]> {
     fn from(value: Vec<T>) -> Self {
         let layout = Layout::for_value(value.as_slice());
         // SAFETY: We trust the Vec iterator to have the correct length
-        unsafe { Self::from_iter_exact_trusted_in(layout, value.into_iter(), Global) }
+        // It should never panic, as it is just transferring ownership
+        unsafe { Self::from_iter_exact_trusted_in::<NeverPanic>(layout, value.into_iter(), Global) }
     }
 }
 impl From<&str> for Brc<str> {
@@ -905,7 +919,7 @@ impl<T> FromIterator<T> for Brc<[T]> {
             // SAFETY: The AssertExactIter verifies the length is correct
             // The Layout is correct
             unsafe {
-                Self::from_iter_exact_trusted_in(
+                Self::from_iter_exact_trusted_in::<MayPanic>(
                     layout,
                     AssertExactIter { len, inner: iter },
                     Global,
