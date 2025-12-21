@@ -89,14 +89,19 @@ mod stable_weak_pointee {
         }
     }
     impl<T> SupportedWeakPointee for [T] {}
-    impl SupportedWeakPointeeInternal for str {
-        #[inline]
-        unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
-            // SAFETY: Caller guarantees pointer is valid
-            unsafe { SupportedWeakPointeeInternal::layout_for_ptr(ptr as *mut [u8]) }
-        }
+    macro_rules! weak_pointee_str_like {
+        ($($target:ty),*) => {
+           $(impl SupportedWeakPointeeInternal for $target {
+                #[inline]
+                unsafe fn layout_for_ptr(ptr: *mut Self) -> Layout {
+                    // SAFETY: Caller guarantees pointer is valid
+                    unsafe { SupportedWeakPointeeInternal::layout_for_ptr(ptr as *mut [u8]) }
+                }
+           }
+           impl SupportedWeakPointee for $target {})*
+        };
     }
-    impl SupportedWeakPointee for str {}
+    weak_pointee_str_like!(str, std::ffi::OsStr, core::ffi::CStr);
 }
 
 /// Indicates that the metadata is supported, meaning it is at most pointer sized.

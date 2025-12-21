@@ -20,6 +20,7 @@ default = ["std"]
 # This feature is *required* to use this library,
 # as we need to use std::thread_local!
 std = ["ptr-meta-stable/std", "serde?/std"]
+
 # Enable all recommended features on the nightly channel.
 #
 # These features make Brc easier to use and a better drop-in replacement for Arc.
@@ -29,6 +30,9 @@ nightly = [
     "nightly-coerce",
     "nightly-ptr-layout",
     "nightly-may-dangle",
+    # This is a very reasonable assumption.
+    # It is less likely to break than any of the official nightly features.
+    "unsafe-assume-osstr-layout",
 ]
 # Use the nightly pointer metadata feature instead of the stable one
 #
@@ -56,6 +60,21 @@ nightly-may-dangle = []
 serde = ["dep:serde"]
 # Implement archery::SharedPointerKind
 archery = ["dep:archery"]
+
+# Assume that OsStr and Path are #[repr(transparent)] wrappers around [u8]
+#
+# This is true in practice for all supported versions of the standard library,
+# but is not an official guarentee and could change in the future.
+# In practice, such a change is unlikely to occur.
+# This assumption is necessary to implement `From<OsStr>` and friends.
+unsafe-assume-osstr-layout = []
+# Assume that CStr is a #[repr(transparent)] wrappers around [u8]
+#
+# This is true in practice for all supported versions of the standard library,
+# but is not an official guarentee and may change in the future.
+# In fact, the comments in the stdlib incdicate a desire to make CStr a thin-pointer in the future.
+# This would break this assumption and require changes.
+unsafe-assume-cstr-layout = []
 
 [dependencies]
 

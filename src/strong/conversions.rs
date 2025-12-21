@@ -1,6 +1,12 @@
 //! Implements conversions to/from [`Brc`].
 //!
 //! These usually require allocation.
+//!
+//! We cannot soundly implement conversions from [`std::ffi::OsStr`],
+//! [`core::ffi::CStr`], or [`std::path::Path`],
+//! as the standard library doesn't make layout guarantees.
+//! It would be possible to provide a feature to bypass this
+//! and take advantage of the known `#[repr(transparent)]`.
 
 use crate::allocator_api::alloc::Global;
 use crate::ptr_meta;
@@ -182,14 +188,13 @@ mod arrayvec {
         }
     }
 }
-impl From<&str> for Brc<str> {
+impl<T: Clone> From<&mut [T]> for Brc<[T]> {
     #[inline]
-    fn from(value: &str) -> Self {
-        let bytes = Brc::<[u8]>::copy_from_slice(value.as_bytes());
-        // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
-        unsafe { Brc::from_raw(Brc::into_raw(bytes) as *mut str) }
+    fn from(value: &mut [T]) -> Self {
+        (&*value).into()
     }
 }
+
 impl<T> FromIterator<T> for Brc<[T]> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
@@ -240,3 +245,100 @@ impl<I: Iterator<Item = T>, T> Iterator for AssertExactIter<I, T> {
     }
 }
 impl<I: Iterator<Item = T>, T> ExactSizeIterator for AssertExactIter<I, T> {}
+
+/// Implement `From<S>` where `S` is a transparent wrapper around a `[u8]`
+///
+/// # Safety
+/// Undefined behavior if `S` is not a transparent wrapper around a [`u8`].
+macro_rules! impl_str_like {
+    (unsafe impl From<&$borrowed:ty> for Brc {
+        type Owned = $owned:ty;
+        fn as_encoded_bytes($this:ident) $as_encoded_bytes:block
+    }) => {
+        impl From<&$borrowed> for Brc<$borrowed> {
+            #[inline]
+            fn from(value: &$borrowed) -> Self {
+                let bytes: &[u8] = {
+                    let $this = value;
+                    $as_encoded_bytes
+                };
+                let bytes: Brc<[u8]> = Brc::<[u8]>::copy_from_slice(bytes);
+                // SAFETY: Caller guarantees this transmute is valid
+                unsafe { Brc::<$borrowed>::from_raw(Brc::into_raw(bytes) as *mut $borrowed) }
+            }
+        }
+        impl From<&mut $borrowed> for Brc<$borrowed> {
+            #[inline]
+            fn from(value: &mut $borrowed) -> Self {
+                let value: &$borrowed = &*value;
+                value.into()
+            }
+        }
+        impl From<$owned> for Brc<$borrowed> {
+            #[inline]
+            fn from(value: $owned) -> Self {
+                let value: &$borrowed = &*value;
+                value.into()
+            }
+        }
+    };
+}
+impl_str_like! {
+    // SAFETY: We know that str is repr(transparent) wrapper around a [u8]
+    unsafe impl From<&str> for Brc {
+        type Owned = String;
+        fn as_encoded_bytes(this) {
+            this.as_bytes()
+        }
+    }
+}
+
+#[cfg(feature = "unsafe-assume-osstr-layout")]
+mod assuming_os_str_layout {
+    use crate::Brc;
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
+
+    impl_str_like! {
+        // SAFETY: We are assuming OsStr is a wrapper around a [u8].
+        // This is true in all supported versions of rust,
+        // and the user has acknowledged this assumption
+        unsafe impl From<&OsStr> for Brc {
+            type Owned = OsString;
+            fn as_encoded_bytes(this) {
+                this.as_encoded_bytes()
+            }
+        }
+    }
+    impl_str_like! {
+        // SAFETY: We are assuming a Path is a wrapper around a OsSTr,
+        // which is in turn a wrapper around [u8].
+        // This is true in all supported versions of rust,
+        // and the user has acknowledged this assumption
+        unsafe impl From<&Path> for Brc {
+            type Owned = PathBuf;
+            fn as_encoded_bytes(this) {
+                this.as_os_str().as_encoded_bytes()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "unsafe-assume-cstr-layout")]
+mod assuming_cstr_layout {
+    use crate::Brc;
+    use alloc::ffi::CString;
+    use core::ffi::CStr;
+
+    impl_str_like! {
+        // SAFETY: We are assuming a Cstr is a wrapper around a [u8].
+        // This is true in all supported versions of rust,
+        // but the comments on CStr indicate that the length may be dropped in the future.
+        unsafe impl From<&CStr> for Brc {
+            type Owned = CString;
+            fn as_encoded_bytes(this) {
+                this.to_bytes_with_nul()
+            }
+        }
+    }
+}
