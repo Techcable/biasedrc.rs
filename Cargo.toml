@@ -73,6 +73,7 @@ thiserror = "2"
 # Third-party integration
 arc-swap = { version = "1.7", optional = true }
 archery = { version = "1", optional = true }
+arrayvec = { version = "0.7", optional = true, default-features = false }
 serde = { package = "serde_core", version = "1", optional = true }
 stable_deref_trait = "1.2"
 

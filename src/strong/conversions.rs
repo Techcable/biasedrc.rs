@@ -162,7 +162,26 @@ from_vec_like! {
             ManuallyDrop::new(src)
         }
     }
+}
+#[cfg(feature = "arrayvec")]
+mod arrayvec {
+    use crate::Brc;
 
+    from_vec_like! {
+        // SAFETY: Fully transfers ownership using ArrayVec::set_len
+        unsafe impl<T, const CAP: usize> From<arrayvec::ArrayVec<T, CAP>> for Brc {
+            fn take_ownership(src) -> () {
+                arrayvec::ArrayVec::set_len(&mut src, 0);
+            }
+        }
+    }
+    impl<const CAP: usize> From<arrayvec::ArrayString<CAP>> for Brc<str> {
+        #[inline]
+        fn from(src: arrayvec::ArrayString<CAP>) -> Brc<str> {
+            src.as_str().into()
+        }
+    }
+}
 impl From<&str> for Brc<str> {
     #[inline]
     fn from(value: &str) -> Self {
