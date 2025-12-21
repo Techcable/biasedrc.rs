@@ -15,6 +15,10 @@ impl<T> Brc<[T]> {
     /// Equivalent to `From<[T]>`, but potentially clearer.
     /// Prefer using [`Brc::copy_from_slice`] wherever possible,
     /// as copying is much faster than cloning.
+    ///
+    /// # Panics
+    /// Will panic if [`T::clone`](Clone::clone) does,
+    /// in addition to the cases that [`Self::new`] does.
     #[inline]
     pub fn clone_from_slice(slice: &[T]) -> Self
     where
@@ -28,6 +32,9 @@ impl<T> Brc<[T]> {
     /// by taking advantage of the `T: Copy` bound.
     /// Even on nightly, this library avoids specialization as it is an "incomplete feature"
     /// with soundness issues.
+    ///
+    /// # Panics
+    /// This function should only panic in the cases [`Self::new`] does.
     #[inline]
     pub fn copy_from_slice(slice: &[T]) -> Self
     where

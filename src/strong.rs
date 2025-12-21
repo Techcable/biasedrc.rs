@@ -57,10 +57,10 @@ impl<T> Brc<T> {
     /// Construct a new [`Brc`] with the specified value.
     ///
     /// # Panics
-    /// This may panic if [`collect`] does.
+    /// This function will trigger an unwinding panic only if [`collect`]
+    /// or [`std::alloc::handle_alloc_error`] does.
     ///
-    /// The behavior on out of memory is determined by [`Box::new`],
-    /// which may either panic or abort.
+    /// It may abort if internal state appears corrupted.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
         Brc::new_in(value, Global)
@@ -71,7 +71,8 @@ impl<T> Brc<T> {
     /// This can potentially improve performance by allowing values to be constructed in place.
     ///
     /// # Panics
-    /// May panic in the same cases that [`Self::new`] does.
+    /// This function will panic whenever the closure does,
+    /// in addition to the cases that [`Self::new`] does.
     #[inline]
     pub fn new_with(func: impl FnOnce() -> T) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
@@ -86,7 +87,7 @@ impl<T> Brc<T> {
         }
     }
 
-    /// Constructs a `Pin<Brc<T>>`.
+    /// Allocates a `Pin<Brc<T>>`, as if wrapping [`Self::new`] in a [`Pin`].
     #[inline]
     pub fn pin(value: T) -> Pin<Self> {
         Brc::pin_in(value, Global)
@@ -95,6 +96,10 @@ impl<T> Brc<T> {
 impl<T, A: Allocator> Brc<T, A> {
     /// Construct a new [`Brc`] with the specified value,
     /// using a particular allocator.
+    ///
+    /// # Panics
+    /// May panic in the same cases described by [`Self::new`],
+    /// or if any method on the allocator panics.
     #[inline]
     pub fn new_in(value: T, alloc: A) -> Self {
         // There is no advantage to waiting for BrcRawHeader::init to initialize the thread state.
@@ -141,6 +146,10 @@ impl<T, A: Allocator> Brc<T, A> {
     /// along with using a particular allocator.
     ///
     /// This can potentially improve performance by allowing values to be constructed in place.
+    ///
+    /// # Panics
+    /// May panic in the same cases as [`Self::new_with`],
+    /// or if any method on the allocator does.
     #[inline]
     pub fn new_with_in(func: impl FnOnce() -> T, alloc: A) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
@@ -319,7 +328,10 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         &this.header().alloc
     }
 
-    /// Initialize the value using the specified callback.
+    /// Allocate new memory,
+    /// initializing the memory using the specified callback.
+    ///
+    /// This method is used to implement all other allocation functions.
     ///
     /// # Safety
     /// Callback must either fully initialize the memory or panic.
@@ -327,6 +339,16 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// It is perfectly safe for [`PanicPolicy::MAY_PANIC`] to be wrong.
     /// In the case of a false positive, we simply include unnecessary cleanup code.
     /// In the case of a false negative, we simply leak memory.
+    ///
+    /// # Panics
+    /// This function will only trigger an unwinding panic in the following cases:
+    /// - if [`collect`] panics
+    /// - if [`std::alloc::handle_alloc_error`] panics.
+    /// - if [`LayoutInfo::new`] encounters arithmetic overflow for the specified layout
+    /// - if the provided callback panics
+    /// - if any method on the provided allocator panics (will not happen for [`Global`])
+    ///
+    /// The function may abort if internal state is corrupted.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
     unsafe fn alloc_with_in<P: PanicPolicy>(
         layout: Layout,
