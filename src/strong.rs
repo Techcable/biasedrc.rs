@@ -75,7 +75,7 @@ impl<T> Brc<T> {
         // SAFETY: Either we fully initialize the newly allocated memory,
         // or the initialization function panics
         unsafe {
-            Self::alloc_with_in(
+            Self::alloc_with_in::<MayPanic>(
                 Layout::new::<T>(),
                 (),
                 |target| target.write(func()),
@@ -108,39 +108,31 @@ impl<T, A: Allocator> Brc<T, A> {
         // Even worse, the drop guard wasn't inlined so the compiler thought the cleanup code
         // could itself panic.
         // This required generating a second landing pad calling core::panicking::panic_in_cleanup()
-        // This generated a ton of code bloat, which had to be inlined into the caller.
+        // This generated a ton of code bloat, which had to be inlined into the caller.s
         //
-        // This improves Brc::new performance by 24% on my M1 macbook.
+        // Avoiding the panic guard improves Brc::new performance by 24% on my M1 macbook.
+        //
+        // When I first implemented this, I reimplemented the allocation code here.
+        // However, it works just as well to pass a `NeverPanic` flag to `new_with_in`.
+        // This means that we don't have to reimplement the allocation code and other constructors
+        // like `From<Box<T>>` can take advantage of the panic .
         //
         // I previously tried to implement this in terms of Box::new
         // on the suspicion that Box::new was more efficient than manual allocation.
         // It turns out that after inlining, they are the same thing.
         // This is a good thing as it means we can use manual `LayoutInfo` calculations
         // in both cases without needing to define a `BrcInner` type.
-        let layout_info = LayoutInfo::<A>::new_or_panic(Layout::new::<T>());
-        let Ok(allocated) = alloc.allocate(layout_info.full_layout) else {
-            alloc::alloc::handle_alloc_error(layout_info.full_layout);
-        };
-        // Past this point, we should not be able to encounter any unwinding panics.
-        // If we are wrong, we just leak the newly allocated memory
-        let header = BrcHeader {
-            // SAFETY: Pinned in memory immediately after construction.
-            strong: unsafe { RawBrcHeader::init() },
-            weak_count: AtomicU32::new(1),
-            alloc: ManuallyDrop::new(alloc),
-        };
-        // SAFETY: Newly allocated memory that starts with the header
+        //
+        // SAFETY: Closure fully initializes the memory and never panics.
+        // Layout information and metadata `()` are correct for T.
         unsafe {
-            allocated.cast::<BrcHeader<A>>().write(header);
+            Self::alloc_with_in::<NeverPanic>(
+                Layout::new::<T>(),
+                (),
+                |dest| dest.write(value),
+                alloc,
+            )
         }
-        // SAFETY: Know the allocation is valid and value offset is correct
-        let value_ptr = unsafe { allocated.byte_offset(layout_info.value_offset).cast::<T>() };
-        // SAFETY: We know the allocated memory has room for T
-        unsafe {
-            value_ptr.write(value);
-        }
-        // SAFETY: Calling Brc::init means we have exactly one shared reference
-        unsafe { Brc::from_raw(value_ptr.as_ptr()) }
     }
 
     /// Construct a new [`Brc`], using a closure to initialize the specified value,
@@ -151,7 +143,14 @@ impl<T, A: Allocator> Brc<T, A> {
     pub fn new_with_in(func: impl FnOnce() -> T, alloc: A) -> Self {
         // SAFETY: Either we fully initialize the newly allocated memory,
         // or the initialization function panics
-        unsafe { Self::alloc_with_in(Layout::new::<T>(), (), |target| target.write(func()), alloc) }
+        unsafe {
+            Self::alloc_with_in::<MayPanic>(
+                Layout::new::<T>(),
+                (),
+                |target| target.write(func()),
+                alloc,
+            )
+        }
     }
 
     /// If the [`Brc`] is uniquely owned,
@@ -276,9 +275,26 @@ impl<T, A: Allocator> Brc<[T], A> {
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
-        unsafe { Brc::alloc_with_in(layout, len, do_init, alloc) }
+        unsafe { Brc::alloc_with_in::<MayPanic>(layout, len, do_init, alloc) }
     }
 }
+
+/// Indicates whether the closure in [`Brc::alloc_with_in`] can panic.
+///
+/// Using [`NeverPanic`] can noticeably improve performance,
+/// as discussed in [`Brc::new_in`].
+pub(crate) trait PanicPolicy {
+    const MAY_PANIC: bool;
+}
+pub(crate) struct MayPanic;
+impl PanicPolicy for MayPanic {
+    const MAY_PANIC: bool = true;
+}
+pub(crate) struct NeverPanic;
+impl PanicPolicy for NeverPanic {
+    const MAY_PANIC: bool = false;
+}
+
 impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// Return a reference to the underlying allocator.
     ///
@@ -292,8 +308,12 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     ///
     /// # Safety
     /// Callback must either fully initialize the memory or panic.
+    ///
+    /// It is perfectly safe for [`PanicPolicy::MAY_PANIC`] to be wrong.
+    /// In the case of a false positive, we simply include unnecessary cleanup code.
+    /// In the case of a false negative, we simply leak memory.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
-    unsafe fn alloc_with_in(
+    unsafe fn alloc_with_in<P: PanicPolicy>(
         layout: Layout,
         meta: T::Metadata,
         func: impl FnOnce(*mut T),
@@ -308,7 +328,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
             alloc: &'a A,
         }
         impl<A: Allocator> Drop for CleanupGuard<'_, A> {
-            #[inline]
+            #[inline(always)] // Unfortunately, core::ptr::drop_in_place still might not be inlined
             fn drop(&mut self) {
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
@@ -318,10 +338,16 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         let Ok(allocated) = alloc.allocate(layout.full_layout) else {
             alloc::alloc::handle_alloc_error(layout.full_layout);
         };
-        let guard = CleanupGuard {
-            ptr: allocated.cast(),
-            layout: layout.full_layout,
-            alloc: &alloc,
+        // SAFETY: It is perfectly safe for P::MAY_PANIC to be wrong.
+        // In that case, we simply leak memory.
+        let guard = if P::MAY_PANIC {
+            Some(CleanupGuard {
+                ptr: allocated.cast(),
+                layout: layout.full_layout,
+                alloc: &alloc,
+            })
+        } else {
+            None
         };
         const {
             assert!(core::mem::offset_of!(BrcHeader<A>, strong) == 0);
@@ -804,7 +830,7 @@ impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
         // SAFETY: Fully initializes the value by copying from the Box.
         // Can only fail if the allocation does
         unsafe {
-            Self::alloc_with_in(
+            Self::alloc_with_in::<NeverPanic>(
                 layout,
                 meta,
                 move |dest| {
