@@ -95,11 +95,7 @@ impl<T, A: Allocator> Brc<T, A> {
     /// using a particular allocator.
     #[inline]
     pub fn new_in(value: T, alloc: A) -> Self {
-        // There is no advantage to waiting for BrcRawHeader::init to initialize the thread state.
-        // This is because if the thread state is uninitialized,
-        // the queue is empty and collection would be a no-op anyway.
-        #[cfg(not(biasedrc_no_implicit_collect))]
-        collect();
+        let thread_id = runtime::LocalThreadState::collect_or_init_tid();
         // This function used to be implemented as Self::new_with(|| value).
         // While correct, this caused code bloat and was noticeably slower than Arc::new.
         //
@@ -125,7 +121,8 @@ impl<T, A: Allocator> Brc<T, A> {
         // If we are wrong, we just leak the newly allocated memory
         let header = BrcHeader {
             // SAFETY: Pinned in memory immediately after construction.
-            strong: unsafe { RawBrcHeader::init() },
+            // Thread id is correct for this thread.
+            strong: unsafe { RawBrcHeader::init_with(thread_id) },
             weak_count: AtomicU32::new(1),
             alloc: ManuallyDrop::new(alloc),
         };
@@ -299,8 +296,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         func: impl FnOnce(*mut T),
         alloc: A,
     ) -> Self {
-        #[cfg(not(biasedrc_no_implicit_collect))]
-        collect();
+        let this_thread_id = runtime::LocalThreadState::collect_or_init_tid();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
         struct CleanupGuard<A: Allocator> {
             ptr: NonNull<u8>,
@@ -330,9 +326,12 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         }
         // SAFETY: Memory is newly allocated so it is known to be valid
         // The RawBrcHeader is pinned immediately after it is created
-        // we just verified above that the field offset is zero
+        // and we just verified above that the field offset is zero.
+        // We also know that `this_thread_id` is valid
         unsafe {
-            allocated.cast::<RawBrcHeader>().write(RawBrcHeader::init());
+            allocated
+                .cast::<RawBrcHeader>()
+                .write(RawBrcHeader::init_with(this_thread_id));
         }
         // SAFETY: Newly allocated memory is valid
         unsafe {
