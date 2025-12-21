@@ -266,21 +266,13 @@ impl LocalThreadState {
             THIS_THREAD_STATE_FAST.with(|state| (state.status.get(), state.short_id.get()));
         match current_status {
             LocalThreadStatus::DeadOrDying => None,
-            LocalThreadStatus::Uninit => Self::collect_or_init_tid_slow(),
-            LocalThreadStatus::Active if Self::currently_needs_collect() => {
-                Self::collect_or_init_tid_slow()
+            LocalThreadStatus::Uninit => Self::init_tid(),
+            LocalThreadStatus::Active => {
+                if Self::currently_needs_collect() {
+                    Self::collect_slow();
+                }
+                thread_id
             }
-            LocalThreadStatus::Active => thread_id,
-        }
-    }
-    #[inline(never)]
-    #[cold]
-    fn collect_or_init_tid_slow() -> Option<ShortThreadId> {
-        if Self::currently_needs_collect() {
-            crate::collect();
-            THIS_THREAD_STATE_FAST.with(|state| state.short_id.get())
-        } else {
-            Self::init_tid()
         }
     }
 
