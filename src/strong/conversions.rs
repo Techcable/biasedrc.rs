@@ -109,26 +109,60 @@ impl<T: Clone> From<&[T]> for Brc<[T]> {
         unsafe { Self::from_iter_exact_trusted_in::<MayPanic>(layout, src.iter().cloned(), Global) }
     }
 }
-impl<T> From<Vec<T>> for Brc<[T]> {
-    fn from(mut src: Vec<T>) -> Self {
-        // SAFETY: We either transfer ownership from the Vec (on success) or drop it (on panic)
-        // The closure fully initializes the result once it is called
-        unsafe {
-            Brc::<[T]>::alloc_with_in::<NeverPanic>(
-                Layout::for_value::<[T]>(src.as_slice()),
-                src.len(),
-                |dest| {
-                    // Nothing past here should panic
-                    let (src_ptr, src_len) = (src.as_mut_ptr(), src.len());
-                    // SAFETY: Transfers ownership with set_len and then fully moves to dest
-                    src.set_len(0);
-                    dest.cast::<T>().copy_from_nonoverlapping(src_ptr, src_len);
-                },
-                Global,
-            )
+/// Implement something like `From<Vec<T>>`,
+/// directly consuming ownership of the elements without needing [`Clone`].
+///
+/// # Safety (soundness)
+/// Must implement `take_ownership` correctly:
+/// After completion, the source must no longer drop the elements.
+///
+/// # Correctness (but not soundness)
+/// Taking ownership should not consume the source allocation, only the source elements.
+/// The `take_ownership` function should not panic.
+macro_rules! from_vec_like {
+    (unsafe impl<$element:ident $(, const $cap:ident: usize)?> From<$src_ty:ty> for Brc {
+        fn take_ownership($src:ident) -> $ownership_taken:ty $take_ownership:block
+    }) => {
+        impl<$element $(, const $cap: usize)?> From<$src_ty> for crate::Brc<[$element]> {
+            fn from(src: $src_ty) -> Self {
+                use crate::allocator_api::alloc::{Layout, Global};
+                // SAFETY: We either transfer ownership from the source (on success) or drop it (on panic)
+                // The closure fully initializes the result once it is called
+                unsafe {
+                    crate::Brc::<[$element]>::alloc_with_in::<crate::strong::NeverPanic>(
+                        Layout::for_value::<[T]>(src.as_slice()),
+                        src.len(),
+                        |dest| {
+                            #[allow(unused_mut, reason = "macro flexibility")]
+                            let mut $src: $src_ty = src;
+                            let (src_ptr, src_len): (*mut $element, usize) = ($src.as_mut_ptr(), $src.len());
+                            // Nothing past here should panic
+                            let _transferred: $ownership_taken = $take_ownership;
+                            dest.cast::<$element>().copy_from_nonoverlapping(src_ptr, src_len);
+                        },
+                        Global,
+                    )
+                }
+            }
+        }
+    };
+}
+from_vec_like! {
+    // SAFETY: Fully transfers ownership using Vec::set_len
+    unsafe impl<T> From<Vec<T>> for Brc {
+        fn take_ownership(src) -> () {
+            src.set_len(0);
         }
     }
 }
+from_vec_like! {
+    // SAFETY: Fully transfers ownership using ManuallyDrop::new
+    unsafe impl<T, const N: usize> From<[T; N]> for Brc {
+        fn take_ownership(src) -> ManuallyDrop<[T; N]> {
+            ManuallyDrop::new(src)
+        }
+    }
+
 impl From<&str> for Brc<str> {
     #[inline]
     fn from(value: &str) -> Self {
