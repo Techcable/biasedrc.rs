@@ -7,6 +7,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[unsafe(no_mangle)]
+pub fn box_new(x: u32) -> Box<u32> {
+    Box::new(x)
+}
+
+#[unsafe(no_mangle)]
 pub fn brc_new(x: u32) -> Brc<u32> {
     Brc::new(x)
 }

@@ -104,6 +104,19 @@ impl<A: Allocator> LayoutInfo<A> {
     pub const MIN_VALUE_ALIGNMENT: usize = 2;
 
     #[inline]
+    pub fn new_or_panic(layout: Layout) -> Self {
+        #[cold]
+        #[inline(never)]
+        fn layout_overflow() -> ! {
+            panic!("Layout of Brc would overflow an isize")
+        }
+        match Self::new(layout) {
+            Ok(res) => res,
+            Err(_) => layout_overflow(),
+        }
+    }
+
+    #[inline]
     pub fn new(layout: Layout) -> Result<Self, core::alloc::LayoutError> {
         let (full_layout, value_offset) =
             Layout::new::<BrcHeader<A>>().extend(layout.align_to(Self::MIN_VALUE_ALIGNMENT)?)?;

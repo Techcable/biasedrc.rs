@@ -57,11 +57,11 @@ impl<T> Brc<T> {
     /// # Panics
     /// This may panic if [`collect`] does.
     ///
-    /// The behavior on out of memory is determined by [`alloc::alloc::handle_alloc_error`],
-    /// which may involve a panic or an abort.
+    /// The behavior on out of memory is determined by [`Box::new`],
+    /// which may either panic or abort.
     #[inline]
     pub fn new(value: T) -> Brc<T> {
-        Self::new_with_in(|| value, Global)
+        Brc::new_in(value, Global)
     }
 
     /// Construct a new [`Brc`], using a closure to initialize the specified value.
@@ -95,7 +95,52 @@ impl<T, A: Allocator> Brc<T, A> {
     /// using a particular allocator.
     #[inline]
     pub fn new_in(value: T, alloc: A) -> Self {
-        Self::new_with_in(|| value, alloc)
+        // There is no advantage to waiting for BrcRawHeader::init to initialize the thread state.
+        // This is because if the thread state is uninitialized,
+        // the queue is empty and collection would be a no-op anyway.
+        #[cfg(not(biasedrc_no_implicit_collect))]
+        collect();
+        // This function used to be implemented as Self::new_with(|| value).
+        // While correct, this caused code bloat and was noticeably slower than Arc::new.
+        //
+        // The main problem is that the compiler was unable to eliminate the drop guard,
+        // as it doesn't seem to realize the closure can't panic.
+        // Even worse, the drop guard wasn't inlined so the compiler thought the cleanup code
+        // could itself panic.
+        // This required generating a second landing pad calling core::panicking::panic_in_cleanup()
+        // This generated a ton of code bloat, which had to be inlined into the caller.
+        //
+        // This improves Brc::new performance by 24% on my M1 macbook.
+        //
+        // I previously tried to implement this in terms of Box::new
+        // on the suspicion that Box::new was more efficient than manual allocation.
+        // It turns out that after inlining, they are the same thing.
+        // This is a good thing as it means we can use manual `LayoutInfo` calculations
+        // in both cases without needing to define a `BrcInner` type.
+        let layout_info = LayoutInfo::<A>::new_or_panic(Layout::new::<T>());
+        let Ok(allocated) = alloc.allocate(layout_info.full_layout) else {
+            alloc::alloc::handle_alloc_error(layout_info.full_layout);
+        };
+        // Past this point, we should not be able to encounter any unwinding panics.
+        // If we are wrong, we just leak the newly allocated memory
+        let header = BrcHeader {
+            // SAFETY: Pinned in memory immediately after construction.
+            strong: unsafe { RawBrcHeader::init() },
+            weak_count: AtomicU32::new(1),
+            alloc: ManuallyDrop::new(alloc),
+        };
+        // SAFETY: Newly allocated memory that starts with the header
+        unsafe {
+            allocated.cast::<BrcHeader<A>>().write(header);
+        }
+        // SAFETY: Know the allocation is valid and value offset is correct
+        let value_ptr = unsafe { allocated.byte_offset(layout_info.value_offset).cast::<T>() };
+        // SAFETY: We know the allocated memory has room for T
+        unsafe {
+            value_ptr.write(value);
+        }
+        // SAFETY: Calling Brc::init means we have exactly one shared reference
+        unsafe { Brc::from_raw(value_ptr.as_ptr()) }
     }
 
     /// Construct a new [`Brc`], using a closure to initialize the specified value,
@@ -256,14 +301,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     ) -> Self {
         #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
-        #[cold]
-        #[inline(never)]
-        fn layout_overflow() -> ! {
-            panic!("Layout of Brc would overflow an isize")
-        }
-        let Ok(layout) = LayoutInfo::<A>::new(layout) else {
-            layout_overflow()
-        };
+        let layout = LayoutInfo::<A>::new_or_panic(layout);
         struct CleanupGuard<A: Allocator> {
             ptr: NonNull<u8>,
             layout: Layout,

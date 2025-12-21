@@ -247,10 +247,13 @@ impl LocalThreadState {
     /// This is measurably faster (about 9%) than the old approach.
     ///
     /// [`RawBrcHeader::init`]: super::RawBrcHeader::init
+    ///
+    /// # Panics
+    /// This function will never unwind, although it may abort.
     #[cold]
     #[inline(never)]
     pub fn init_tid() -> Option<ShortThreadId> {
-        LocalThreadState::with_current(LocalThreadState::short_id).ok()
+        nounwind::abort_unwind(|| LocalThreadState::with_current(LocalThreadState::short_id).ok())
     }
 
     /// Access the current thread info inside the specified closure.

@@ -78,6 +78,9 @@ impl RawBrcHeader {
     ///
     /// # Safety
     /// The resulting header must be pinned in-memory before it is ever used.
+    ///
+    /// # Panics
+    /// This function will never unwind, although it may abort.
     #[inline]
     pub unsafe fn init() -> Self {
         let this_id = match LocalThreadState::existing_short_id() {
