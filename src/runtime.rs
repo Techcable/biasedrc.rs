@@ -1,6 +1,4 @@
-use crate::runtime::threads::{
-    LocalThreadAccessError, LocalThreadState, SharedThreadInfo, ShortThreadId,
-};
+use crate::runtime::threads::{LocalThreadAccessError, SharedThreadInfo, ShortThreadId};
 use arbitrary_int::prelude::*;
 use cfg_if::cfg_if;
 use core::ffi::c_void;
@@ -12,6 +10,9 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 
 mod threads;
+
+// TODO: Eliminate this?
+pub use threads::LocalThreadState;
 
 /// An error returned by [`Brc::biased_count`],
 /// either caused by being the wrong thread or not being biased at all.
@@ -78,24 +79,13 @@ impl RawBrcHeader {
     ///
     /// # Safety
     /// The resulting header must be pinned in-memory before it is ever used.
+    /// The thread id must be correct for this thread, or be `None`.
     ///
     /// # Panics
     /// This function will never unwind, although it may abort.
     #[inline]
-    pub unsafe fn init() -> Self {
-        let this_id = match LocalThreadState::existing_short_id() {
-            Ok(short_id) => Some(short_id),
-            Err(LocalThreadAccessError::Dead | LocalThreadAccessError::IdOverflow(_)) => {
-                // in this case, the local state was already initialized,
-                // but we cannot participate in biased reference counting
-                None
-            }
-            Err(LocalThreadAccessError::Uninitialized) => {
-                // Need to actually initialize the thread state
-                LocalThreadState::init_tid()
-            }
-        };
-        match this_id {
+    pub unsafe fn init_with(this_thread_id: Option<ShortThreadId>) -> Self {
+        match this_thread_id {
             None => RawBrcHeader {
                 shared_word: AtomicUsize::new(
                     SharedWord {
