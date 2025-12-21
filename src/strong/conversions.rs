@@ -110,11 +110,23 @@ impl<T: Clone> From<&[T]> for Brc<[T]> {
     }
 }
 impl<T> From<Vec<T>> for Brc<[T]> {
-    fn from(value: Vec<T>) -> Self {
-        let layout = Layout::for_value(value.as_slice());
-        // SAFETY: We trust the Vec iterator to have the correct length
-        // It should never panic, as it is just transferring ownership
-        unsafe { Self::from_iter_exact_trusted_in::<NeverPanic>(layout, value.into_iter(), Global) }
+    fn from(mut src: Vec<T>) -> Self {
+        // SAFETY: We either transfer ownership from the Vec (on success) or drop it (on panic)
+        // The closure fully initializes the result once it is called
+        unsafe {
+            Brc::<[T]>::alloc_with_in::<NeverPanic>(
+                Layout::for_value::<[T]>(src.as_slice()),
+                src.len(),
+                |dest| {
+                    // Nothing past here should panic
+                    let (src_ptr, src_len) = (src.as_mut_ptr(), src.len());
+                    // SAFETY: Transfers ownership with set_len and then fully moves to dest
+                    src.set_len(0);
+                    dest.cast::<T>().copy_from_nonoverlapping(src_ptr, src_len);
+                },
+                Global,
+            )
+        }
     }
 }
 impl From<&str> for Brc<str> {
