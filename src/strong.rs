@@ -302,19 +302,17 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
-        struct CleanupGuard<A: Allocator> {
+        struct CleanupGuard<'a, A: Allocator> {
             ptr: NonNull<u8>,
             layout: Layout,
-            alloc: ManuallyDrop<A>,
+            alloc: &'a A,
         }
-        impl<A: Allocator> Drop for CleanupGuard<A> {
+        impl<A: Allocator> Drop for CleanupGuard<'_, A> {
             #[inline]
             fn drop(&mut self) {
-                // SAFETY: Will not be used after this
-                let alloc = unsafe { ManuallyDrop::take(&mut self.alloc) };
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
-                unsafe { alloc.deallocate(self.ptr, self.layout) }
+                unsafe { self.alloc.deallocate(self.ptr, self.layout) }
             }
         }
         let Ok(allocated) = alloc.allocate(layout.full_layout) else {
@@ -323,7 +321,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         let guard = CleanupGuard {
             ptr: allocated.cast(),
             layout: layout.full_layout,
-            alloc: ManuallyDrop::new(alloc),
+            alloc: &alloc,
         };
         const {
             assert!(core::mem::offset_of!(BrcHeader<A>, strong) == 0);
@@ -351,10 +349,8 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         };
         let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
         func(value_ptr);
-        let mut guard = ManuallyDrop::new(guard);
-        // SAFETY: No longer Drop the guard, so that no longer needs the allocator
-        let alloc = unsafe { ManuallyDrop::take(&mut guard.alloc) };
-        // Now we have the allocator, we can initialize the rest of the header
+        core::mem::forget(guard);
+        // The guard no longer borrows the allocator, so now we can move it to the header.
         // SAFETY: Know that the allocated memory starts with a BrcHeader
         unsafe {
             allocated
