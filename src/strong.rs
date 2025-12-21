@@ -305,12 +305,13 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         struct CleanupGuard<A: Allocator> {
             ptr: NonNull<u8>,
             layout: Layout,
-            alloc: Option<A>,
+            alloc: ManuallyDrop<A>,
         }
         impl<A: Allocator> Drop for CleanupGuard<A> {
             #[inline]
             fn drop(&mut self) {
-                let alloc = self.alloc.take().unwrap();
+                // SAFETY: Will not be used after this
+                let alloc = unsafe { ManuallyDrop::take(&mut self.alloc) };
                 // SAFETY: We know the pointer is valid since we just allocated it
                 // We are careful to forget the guard if we are successful
                 unsafe { alloc.deallocate(self.ptr, self.layout) }
@@ -319,10 +320,10 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         let Ok(allocated) = alloc.allocate(layout.full_layout) else {
             alloc::alloc::handle_alloc_error(layout.full_layout);
         };
-        let mut guard = CleanupGuard {
+        let guard = CleanupGuard {
             ptr: allocated.cast(),
             layout: layout.full_layout,
-            alloc: Some(alloc),
+            alloc: ManuallyDrop::new(alloc),
         };
         const {
             assert!(core::mem::offset_of!(BrcHeader<A>, strong) == 0);
@@ -350,8 +351,9 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         };
         let value_ptr = ptr_meta::from_raw_parts_mut(value_ptr_addr, meta);
         func(value_ptr);
-        let alloc = guard.alloc.take().unwrap();
-        core::mem::forget(guard);
+        let mut guard = ManuallyDrop::new(guard);
+        // SAFETY: No longer Drop the guard, so that no longer needs the allocator
+        let alloc = unsafe { ManuallyDrop::take(&mut guard.alloc) };
         // Now we have the allocator, we can initialize the rest of the header
         // SAFETY: Know that the allocated memory starts with a BrcHeader
         unsafe {
