@@ -22,6 +22,9 @@
 
 extern crate alloc;
 
+#[cfg(not(feature = "std"))]
+compile_error!("The standard library is required to use `biasedrc`");
+
 #[cfg(feature = "nightly-allocator")]
 pub(crate) use alloc as allocator_api;
 #[cfg(not(feature = "nightly-allocator"))]
