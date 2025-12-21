@@ -19,6 +19,8 @@ use crate::{
     collect, runtime,
 };
 
+mod conversions;
+
 /// A thread-safe reference counted object,
 /// biased towards a particular thread.
 ///
@@ -217,7 +219,7 @@ impl<T, A: Allocator> Brc<T, A> {
     }
 }
 impl<T, A: Allocator> Brc<[T], A> {
-    /// Allocate a slice of memory rom a [`Layout`] and a,
+    /// Allocate a slice of memory rom a [`Layout`] and an iterator,
     /// whose length is trusted to be exact.
     ///
     /// The iterator is permitted to panic, both in [`Iterator::next`] and [`Drop`].
@@ -230,6 +232,8 @@ impl<T, A: Allocator> Brc<[T], A> {
     ///
     /// The iterator must either panic or yield precisely as many elements as its length.
     #[deny(clippy::multiple_unsafe_ops_per_block)]
+    #[track_caller] // want to propagate iterator panics
+    #[inline]
     pub(crate) unsafe fn from_iter_exact_trusted_in<P: PanicPolicy>(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
@@ -816,121 +820,6 @@ unsafe impl<T: ?Sized + SupportedPointee + Sync + Send, A: Allocator + Send + Sy
 
 // SAFETY: A Cloned Brc just increments the RC, so memory location is the same
 unsafe impl<T: ?Sized + SupportedPointee, A: Allocator> CloneStableDeref for Brc<T, A> {}
-
-//
-// conversion impls (usually involves allocation)
-//
-
-impl<T> From<T> for Brc<T> {
-    #[inline]
-    fn from(value: T) -> Self {
-        Brc::new(value)
-    }
-}
-/// Convert from a [`Box`] to a [`Brc`].
-///
-/// This conversion is guaranteed not to copy values to the stack,
-/// which means large values cannot trigger stack overflow.
-///
-/// However, this cannot reuse the allocation as a [`Box`] has no room to hold the reference count.
-impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
-    #[inline]
-    fn from(value: Box<T>) -> Self {
-        let meta = ptr_meta::metadata(&raw const *value);
-        let layout = Layout::for_value::<T>(&*value);
-        // SAFETY: Fully initializes the value by copying from the Box.
-        // Can only fail if the allocation does
-        unsafe {
-            Self::alloc_with_in::<NeverPanic>(
-                layout,
-                meta,
-                move |dest| {
-                    let value = ManuallyDrop::new(value);
-                    dest.cast::<u8>().copy_from_nonoverlapping(
-                        core::ptr::from_ref::<T>(&**value).cast::<u8>(),
-                        layout.size(),
-                    );
-                    drop(ManuallyDrop::into_inner(value));
-                },
-                Global,
-            )
-        }
-    }
-}
-impl<T: Clone> From<&[T]> for Brc<[T]> {
-    fn from(src: &[T]) -> Self {
-        let layout = Layout::for_value(src);
-        // SAFETY: We trust the slice iterator + cloned() to have correct length or panic
-        // It would be nice if we could ask `is_copy::<T>`,
-        // but we unfortunately cannot without specialization.
-        unsafe { Self::from_iter_exact_trusted_in::<MayPanic>(layout, src.iter().cloned(), Global) }
-    }
-}
-impl<T> From<Vec<T>> for Brc<[T]> {
-    fn from(value: Vec<T>) -> Self {
-        let layout = Layout::for_value(value.as_slice());
-        // SAFETY: We trust the Vec iterator to have the correct length
-        // It should never panic, as it is just transferring ownership
-        unsafe { Self::from_iter_exact_trusted_in::<NeverPanic>(layout, value.into_iter(), Global) }
-    }
-}
-impl From<&str> for Brc<str> {
-    #[inline]
-    fn from(value: &str) -> Self {
-        let bytes = Brc::<[u8]>::from(value.as_bytes());
-        // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
-        unsafe { Brc::from_raw(Brc::into_raw(bytes) as *mut str) }
-    }
-}
-impl<T> FromIterator<T> for Brc<[T]> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        if Some(lower) == upper {
-            /// Verifies that the iterator has the claimed length,
-            /// and panics if it doesn't.
-            struct AssertExactIter<I: Iterator<Item = T>, T> {
-                inner: I,
-                len: usize,
-            }
-            impl<I: Iterator<Item = T>, T> Iterator for AssertExactIter<I, T> {
-                type Item = T;
-                #[inline]
-                #[track_caller]
-                fn next(&mut self) -> Option<Self::Item> {
-                    match (self.inner.next(), self.len) {
-                        (None, 0) => None,
-                        (Some(_), 0) => panic!("Iterator yielded more items than claimed length"),
-                        (Some(item), _) => {
-                            self.len -= 1;
-                            Some(item)
-                        }
-                        (None, _) => panic!("Iterator yielded fewer items than claimed length"),
-                    }
-                }
-                #[inline]
-                fn size_hint(&self) -> (usize, Option<usize>) {
-                    (self.len, Some(self.len))
-                }
-            }
-            impl<I: Iterator<Item = T>, T> ExactSizeIterator for AssertExactIter<I, T> {}
-            let len = lower;
-            let layout = Layout::array::<T>(len).expect("Layout overflow");
-            // SAFETY: The AssertExactIter verifies the length is correct
-            // The Layout is correct
-            unsafe {
-                Self::from_iter_exact_trusted_in::<MayPanic>(
-                    layout,
-                    AssertExactIter { len, inner: iter },
-                    Global,
-                )
-            }
-        } else {
-            // need to buffer
-            iter.collect::<Vec<T>>().into()
-        }
-    }
-}
 
 //
 // drop & clone logic
