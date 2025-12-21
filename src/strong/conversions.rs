@@ -9,12 +9,55 @@ use crate::{Brc, SupportedPointee};
 use core::alloc::Layout;
 use core::mem::ManuallyDrop;
 
+impl<T> Brc<[T]> {
+    /// Create a new [`Brc`], cloning each element from the specified slice.
+    ///
+    /// Equivalent to `From<[T]>`, but potentially clearer.
+    /// Prefer using [`Brc::copy_from_slice`] wherever possible,
+    /// as copying is much faster than cloning.
+    #[inline]
+    pub fn clone_from_slice(slice: &[T]) -> Self
+    where
+        T: Clone,
+    {
+        Self::from(slice)
+    }
+    /// Create a new [`Brc`], using a `memcpy` of the specified slice
+    ///
+    /// This is more efficient than [`Self::clone_from_slice`] or `From<&[T]>`,
+    /// by taking advantage of the `T: Copy` bound.
+    /// Even on nightly, this library avoids specialization as it is an "incomplete feature"
+    /// with soundness issues.
+    #[inline]
+    pub fn copy_from_slice(slice: &[T]) -> Self
+    where
+        T: Copy,
+    {
+        let layout = Layout::for_value::<[T]>(slice);
+        // SAFETY: We know layout is correct for [T],
+        // and the memcpy ensures the result is fully initialized
+        unsafe {
+            Self::alloc_with_in::<NeverPanic>(
+                layout,
+                slice.len(),
+                |dest| {
+                    // SAFETY: This is fine because T: Copy
+                    dest.cast::<T>()
+                        .copy_from_nonoverlapping(slice.as_ptr(), slice.len());
+                },
+                Global,
+            )
+        }
+    }
+}
+
 impl<T> From<T> for Brc<T> {
     #[inline]
     fn from(value: T) -> Self {
         Brc::new(value)
     }
 }
+
 /// Convert from a [`Box`] to a [`Brc`].
 ///
 /// This conversion is guaranteed not to copy values to the stack,
@@ -45,6 +88,11 @@ impl<T: ?Sized + SupportedPointee> From<Box<T>> for Brc<T> {
         }
     }
 }
+/// Create a new `Brc<[T]>` by cloning the contents of the specified slice.
+///
+/// Equivalent to calling [`Brc::clone_from_slice`].
+/// Prefer using [`Brc::copy_from_slice`] wherever possible,
+/// as copying is much faster than cloning.
 impl<T: Clone> From<&[T]> for Brc<[T]> {
     fn from(src: &[T]) -> Self {
         let layout = Layout::for_value(src);
@@ -65,7 +113,7 @@ impl<T> From<Vec<T>> for Brc<[T]> {
 impl From<&str> for Brc<str> {
     #[inline]
     fn from(value: &str) -> Self {
-        let bytes = Brc::<[u8]>::from(value.as_bytes());
+        let bytes = Brc::<[u8]>::copy_from_slice(value.as_bytes());
         // SAFETY: A str has the same repr as [u8], and we know the UTF8 is valid
         unsafe { Brc::from_raw(Brc::into_raw(bytes) as *mut str) }
     }
