@@ -256,6 +256,34 @@ impl LocalThreadState {
         nounwind::abort_unwind(|| LocalThreadState::with_current(LocalThreadState::short_id).ok())
     }
 
+    /// Either call [`collect`] or initialize the thread state,
+    /// depending on the previous thread state.
+    ///
+    /// This function is a performance experiment.
+    #[inline]
+    pub fn collect_or_init_tid() -> Option<ShortThreadId> {
+        let (current_status, thread_id) =
+            THIS_THREAD_STATE_FAST.with(|state| (state.status.get(), state.short_id.get()));
+        match current_status {
+            LocalThreadStatus::DeadOrDying => None,
+            LocalThreadStatus::Uninit => Self::collect_or_init_tid_slow(),
+            LocalThreadStatus::Active if Self::currently_needs_collect() => {
+                Self::collect_or_init_tid_slow()
+            }
+            LocalThreadStatus::Active => thread_id,
+        }
+    }
+    #[inline(never)]
+    #[cold]
+    fn collect_or_init_tid_slow() -> Option<ShortThreadId> {
+        if Self::currently_needs_collect() {
+            crate::collect();
+            THIS_THREAD_STATE_FAST.with(|state| state.short_id.get())
+        } else {
+            Self::init_tid()
+        }
+    }
+
     /// Access the current thread info inside the specified closure.
     ///
     /// # Safety
