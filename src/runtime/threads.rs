@@ -1,5 +1,5 @@
 #![allow(clippy::disallowed_types, reason = "Need Arc to hold queue")]
-use crate::runtime::QueuedObject;
+use crate::runtime::{QueuedObject, UnwindPolicy};
 use alloc::sync::{Arc, Weak};
 use arbitrary_int::prelude::*;
 use atomic::Atomic;
@@ -308,25 +308,38 @@ impl LocalThreadState {
     }
 
     #[inline]
+    #[expect(
+        clippy::manual_unwrap_or_default,
+        reason = "clearer handling of AccessError"
+    )]
     pub fn currently_needs_collect() -> bool {
-        THIS_THREAD_STATE_FAST.with(|fast| {
+        match THIS_THREAD_STATE_FAST.try_with(|fast| {
             // compiles to comparison against zero
             !matches!(
                 fast.shared_state_flag.get().load(Ordering::Relaxed),
                 ThreadStateFlag::Live
             )
-        })
+        }) {
+            Ok(res) => res,
+            Err(AccessError { .. }) => {
+                // This should never happen as the variable has const init and no Drop..
+                // As of this writing, LLVM is able to determine this statically.
+                // If either one of these assumptions fails to hold,
+                // we instead risk a false negative.
+                false
+            }
+        }
     }
 
-    /// The slow path for [`crate::collect`].
+    /// The slow path for [`crate::runtime::collect`] and [`crate::runtime::collect_nounwind`].
     ///
     /// This is a separate function to indicate that it is a cold path and to favor outlining.
     #[cold]
     #[inline(never)]
-    pub(super) fn collect_slow() {
+    pub(super) fn collect_slow<T: UnwindPolicy>() {
         // we ignore any access error
         let _ = Self::with_current(|state| {
-            nounwind::abort_unwind(|| {
+            T::maybe_abort_unwind(|| {
                 if std::thread::panicking() {
                     // skip collection if we are panicking (helpful if called by Drop)
                     return;
@@ -345,48 +358,51 @@ impl LocalThreadState {
     /// Forcibly perform thread-local cleanup operations.
     ///
     /// This requires acquiring a state lock to prevent thread death.
+    ///
+    /// # Panics
+    /// This function may unwind if one of the destructors panics.
+    ///
+    /// It is not affected by
     #[cold]
     #[inline(never)]
     pub fn collect_force(&self) {
-        nounwind::abort_unwind(|| {
-            let this_state = self.shared_info.state_flag.load(Ordering::Acquire);
-            match this_state {
-                ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
-                    // this can still be destroyed if the state
-                    // is changed to dying after we perform the initial read.
-                    // In that case, skip processing, as the destructors handled things.
-                    let Some(queue) = Weak::upgrade(&self.shared_info.queued_objects) else {
-                        return;
-                    };
-                    loop {
-                        // SAFETY: We are the biased thread,
-                        // so can safely adjust the RCs without a lock
-                        unsafe {
-                            queue.do_process();
-                        }
-                        // Update the state to indicate we have processed things.
-                        let _ = self.shared_info.state_flag.compare_exchange(
-                            ThreadStateFlag::QueuedObjects,
-                            ThreadStateFlag::Live,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        // It is possible a race causes us to make a mistake in the line above:
-                        // If we go to sleep after `do_process`
-                        // another thread could add to the queue and
-                        // cause us to ignore its status flag here.
-                        // To avoid this, we check again to see if the queue really is empty.
-                        if queue.inner.is_empty() {
-                            break;
-                        }
+        let this_state = self.shared_info.state_flag.load(Ordering::Acquire);
+        match this_state {
+            ThreadStateFlag::Live | ThreadStateFlag::QueuedObjects => {
+                // this can still be destroyed if the state
+                // is changed to dying after we perform the initial read.
+                // In that case, skip processing, as the destructors handled things.
+                let Some(queue) = Weak::upgrade(&self.shared_info.queued_objects) else {
+                    return;
+                };
+                loop {
+                    // SAFETY: We are the biased thread,
+                    // so can safely adjust the RCs without a lock
+                    unsafe {
+                        queue.do_process();
+                    }
+                    // Update the state to indicate we have processed things.
+                    let _ = self.shared_info.state_flag.compare_exchange(
+                        ThreadStateFlag::QueuedObjects,
+                        ThreadStateFlag::Live,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    // It is possible a race causes us to make a mistake in the line above:
+                    // If we go to sleep after `do_process`
+                    // another thread could add to the queue and
+                    // cause us to ignore its status flag here.
+                    // To avoid this, we check again to see if the queue really is empty.
+                    if queue.inner.is_empty() {
+                        break;
                     }
                 }
-                ThreadStateFlag::Dead | ThreadStateFlag::Dying => {
-                    // do nothing, as the destructor is executing
-                    // and is responsible for handling things
-                }
             }
-        });
+            ThreadStateFlag::Dead | ThreadStateFlag::Dying => {
+                // do nothing, as the destructor is executing
+                // and is responsible for handling things
+            }
+        }
     }
 }
 impl Drop for LocalThreadState {

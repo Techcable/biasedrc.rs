@@ -47,7 +47,9 @@ mod third_party;
 mod weak;
 
 pub use crate::pointee::{SupportedPointee, SupportedWeakPointee};
-pub use crate::runtime::{BiasedCountError, ImpreciseRefCountError, collect, collect_force};
+pub use crate::runtime::{
+    BiasedCountError, ImpreciseRefCountError, collect, collect_force, collect_nounwind,
+};
 pub use crate::strong::Brc;
 #[allow(unused_imports, reason = "may be nop if no features are enabled")]
 pub use crate::third_party::*;

@@ -13,6 +13,42 @@ use core::sync::atomic::Ordering;
 
 mod threads;
 
+/// Indicates whether code is allowed to unwind on panic.
+///
+/// This is used in two contexts:
+/// First, it determines whether a panic guard is needed for [`crate::Brc::alloc_with_in`].
+/// Using [`NeverPanic`] can avoid this overhead, as described in [`crate::Brc::new_in`].
+///
+/// In the second case, it determines whether panicking destructors called by [`crate::collect`]
+/// are permitted to unwind into the caller, or if the panics must be turned into aborts.
+///
+/// # Safety
+/// The safety of choosing an unwind policy depends on the context.
+/// However, in both of the above contexts, this choice is safe.
+pub(crate) trait UnwindPolicy {
+    const MAY_UNWIND: bool;
+    /// If unwinding is forbidden, use [`nounwind::abort_unwind`].
+    ///
+    /// Otherwise, invoke the closure directly.
+    fn maybe_abort_unwind<R>(func: impl FnOnce() -> R) -> R;
+}
+pub(crate) struct MayPanic;
+impl UnwindPolicy for MayPanic {
+    const MAY_UNWIND: bool = cfg!(panic = "unwind");
+    #[inline(always)]
+    fn maybe_abort_unwind<R>(func: impl FnOnce() -> R) -> R {
+        func()
+    }
+}
+pub(crate) struct NeverPanic;
+impl UnwindPolicy for NeverPanic {
+    const MAY_UNWIND: bool = false;
+    #[inline(always)]
+    fn maybe_abort_unwind<R>(func: impl FnOnce() -> R) -> R {
+        nounwind::abort_unwind(func)
+    }
+}
+
 /// An error returned by [`Brc::biased_count`],
 /// either caused by being the wrong thread or not being biased at all.
 ///
@@ -907,21 +943,42 @@ pub(super) unsafe fn explicit_merge(biased_tid: ShortThreadId, object: QueuedObj
 /// This is necessary to unbias reference counts migrating across threads.
 /// Unlike traditional garbage collection, this should be needed rarely and run quickly.
 ///
-/// This function is implicitly called by [`crate::Brc::new`],
+/// Collections are implicitly performed by [`crate::Brc::new`],
 /// [`crate::Brc::clone`], and [`crate::Brc::drop`],
 /// so only it needs to be invoked implicitly if a thread goes a long time without calling these functions.
 ///
 /// This function currently does nothing if [`std::thread::panicking`] returns true,
 /// but this behavior is not guaranteed and may change in the future.
 ///
-/// # Panics
-/// Will panic only if one of the deferred destructors panics.
+/// # Unwinding & Panics
+/// This function will unwind if and only if one of the deferred destructors panics.
 ///
-/// May abort if internal state is irreparably corrupted.
+/// If unwinding needs to be forbidden, use the [`collect_nounwind`] function instead.
+/// That function will abort in cases that `collect` would unwind,
+/// and is the default behavior for implicit collections.
+///
+/// Internal errors and reference-count overflow will result in aborting panics.
 #[inline]
 pub fn collect() {
     if LocalThreadState::currently_needs_collect() {
-        LocalThreadState::collect_slow();
+        LocalThreadState::collect_slow::<MayPanic>();
+    }
+}
+
+/// Equivalent to [`collect()`], but panics in deferred destructors trigger aborts instead of unwinding.
+///
+/// This is the default behavior for implicit collections (see below).
+///
+/// # Unwinding & Panics
+/// Unlike [`collect()`], this function will never unwind under any circumstances.
+/// In particular, this means that panics in deferred constructors will trigger aborts.
+///
+/// This function is semantically equivalent to `nounwind::abort_unwind(collect)`.
+/// It is slightly more efficient by avoiding an extra landing pad in the fast-path.
+#[inline]
+pub fn collect_nounwind() {
+    if LocalThreadState::currently_needs_collect() {
+        LocalThreadState::collect_slow::<NeverPanic>();
     }
 }
 
@@ -934,14 +991,16 @@ pub(crate) fn collect_implicit() {
     )) {
         // do nothing
     } else {
-        collect();
+        collect_nounwind();
     }
 }
 
 /// Forcibly perform the [`collect`] operation, regardless of internal heuristics.
 ///
-/// # Panics
-/// Panics in the same cases that [`collect`] does.
+/// # Unwinding & Panics
+/// This function unwinds and aborts in the same cases that [`collect`] does.
+///
+/// If you want to forbid unwinding, you should wrap this in a [`nounwind::abort_unwind`] call.
 #[cold]
 pub fn collect_force() {
     let _ = LocalThreadState::with_current(LocalThreadState::collect_force);

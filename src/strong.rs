@@ -13,7 +13,10 @@ use crate::allocator_api::alloc::{Allocator, Global};
 use crate::layout::{BrcHeader, LayoutInfo, WEAK_LOCKED_COUNT, WEAK_OVERFLOW_THRESHOLD};
 use crate::pointee::SupportedMetadata;
 use crate::ptr_meta::{self, Pointee};
-use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader, collect_implicit};
+use crate::runtime::{
+    DropInfo, ErasedDestructorContext, MayPanic, NeverPanic, RawBrcHeader, UnwindPolicy,
+    collect_implicit,
+};
 use crate::{
     BiasedCountError, ImpreciseRefCountError, SupportedPointee, SupportedWeakPointee, Weak,
     collect, runtime,
@@ -102,9 +105,7 @@ impl<T, A: Allocator> Brc<T, A> {
     /// or if any method on the allocator panics.
     #[inline]
     pub fn new_in(value: T, alloc: A) -> Self {
-        // There is no advantage to waiting for BrcRawHeader::init to initialize the thread state.
-        // This is because if the thread state is uninitialized,
-        // the queue is empty and collection would be a no-op anyway.
+        #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
         // This function used to be implemented as Self::new_with(|| value).
         // While correct, this caused code bloat and was noticeably slower than Arc::new.
@@ -231,7 +232,7 @@ impl<T, A: Allocator> Brc<[T], A> {
     /// whose length is trusted to be exact.
     ///
     /// The iterator is permitted to panic, both in [`Iterator::next`] and [`Drop`].
-    /// Passing an incorrect [`PanicPolicy`] is perfectly safe,
+    /// Passing an incorrect [`UnwindPolicy`] is perfectly safe,
     /// for the same reasons as it is in [`Self::alloc_with_in`].
     ///
     /// # Safety
@@ -242,7 +243,7 @@ impl<T, A: Allocator> Brc<[T], A> {
     #[deny(clippy::multiple_unsafe_ops_per_block)]
     #[track_caller] // want to propagate iterator panics
     #[inline]
-    pub(crate) unsafe fn from_iter_exact_trusted_in<P: PanicPolicy>(
+    pub(crate) unsafe fn from_iter_exact_trusted_in<U: UnwindPolicy>(
         layout: Layout,
         mut iter: impl ExactSizeIterator<Item = T>,
         alloc: A,
@@ -265,7 +266,7 @@ impl<T, A: Allocator> Brc<[T], A> {
                     }
                 }
             }
-            let mut guard = if P::MAY_PANIC && core::mem::needs_drop::<T>() {
+            let mut guard = if U::MAY_UNWIND && core::mem::needs_drop::<T>() {
                 Some(PartialDropGuard {
                     dest,
                     initialized_len: 0,
@@ -278,7 +279,7 @@ impl<T, A: Allocator> Brc<[T], A> {
                     guard.initialized_len = index;
                 }
                 // SAFETY: We trust the length to be exact, so unwrap_unchecked is sound
-                // The next() call is always allowed to panic (PanicPolicy is allowed to lie)
+                // The next() call is always allowed to panic (UnwindPolicy is allowed to lie)
                 let item = unsafe { iter.next().unwrap_unchecked() };
                 // SAFETY: Index is in bounds
                 let slot = unsafe { dest.add(index) };
@@ -289,33 +290,13 @@ impl<T, A: Allocator> Brc<[T], A> {
             // We don't want to do this in the drop function as that could trigger a double-panic
             // This is zero-cost if the iterator has no side effects
             let _ = iter.next();
-            drop(iter); // this is always permitted to panic, as PanicPolicy is allowed to lie
+            drop(iter); // this is always permitted to panic, as UnwindPolicy is allowed to lie
             core::mem::forget(guard); // finished initialization
         };
         // SAFETY: Either fully initializes the memory or panics
         // We trust the iterator to be exact.
-        unsafe { Brc::alloc_with_in::<P>(layout, len, do_init, alloc) }
+        unsafe { Brc::alloc_with_in::<U>(layout, len, do_init, alloc) }
     }
-}
-
-/// Indicates whether the closure in [`Brc::alloc_with_in`] can panic.
-///
-/// Using [`NeverPanic`] can noticeably improve performance,
-/// as discussed in [`Brc::new_in`].
-///
-/// # Safety
-/// The [`Self::MAY_PANIC`] flag is intended as a hint,
-/// and should not be relied upon for memory safety.
-pub(crate) trait PanicPolicy {
-    const MAY_PANIC: bool;
-}
-pub(crate) struct MayPanic;
-impl PanicPolicy for MayPanic {
-    const MAY_PANIC: bool = true;
-}
-pub(crate) struct NeverPanic;
-impl PanicPolicy for NeverPanic {
-    const MAY_PANIC: bool = false;
 }
 
 impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
@@ -335,7 +316,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     /// # Safety
     /// Callback must either fully initialize the memory or panic.
     ///
-    /// It is perfectly safe for [`PanicPolicy::MAY_PANIC`] to be wrong.
+    /// It is perfectly safe for [`UnwindPolicy::MAY_UNWIND`] to be wrong.
     /// In the case of a false positive, we simply include unnecessary cleanup code.
     /// In the case of a false negative, we simply leak memory.
     ///
@@ -349,12 +330,19 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
     ///
     /// The function may abort if internal state is corrupted.
     #[inline(always)] // Inlining means we can potentially eliminate the guard & layout calculation
-    unsafe fn alloc_with_in<P: PanicPolicy>(
+    unsafe fn alloc_with_in<U: UnwindPolicy>(
         layout: Layout,
         meta: T::Metadata,
         func: impl FnOnce(*mut T),
         alloc: A,
     ) -> Self {
+        // Logically speaking, there is no advantage to waiting for BrcRawHeader::init
+        // to initialize the thread state.
+        // This is because if the thread state is uninitialized,
+        // the queue is empty and collect() would be a no-op anyway.
+        //
+        // However, there may be a performance advantage to merging the checks together.
+        // At some point, we should investigate and benchmark the effect of that change.
         collect_implicit();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
         struct CleanupGuard<'a, A: Allocator> {
@@ -375,7 +363,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         };
         // SAFETY: It is perfectly safe for P::MAY_PANIC to be wrong.
         // In that case, we simply leak memory.
-        let guard = if P::MAY_PANIC {
+        let guard = if U::MAY_UNWIND {
             Some(CleanupGuard {
                 ptr: allocated.cast(),
                 layout: layout.full_layout,
@@ -933,7 +921,7 @@ unsafe impl<#[may_dangle] T: ?Sized + SupportedPointee, A: Allocator> Drop for B
     #[inline]
     fn drop(&mut self) {
         #[cfg(not(biasedrc_no_implicit_collect_drop))]
-        collect_implicit();
+        crate::runtime::collect_implicit();
         // SAFETY: Drop function is executed at most once
         // and Brc cannot be used once it completes.
         unsafe {
@@ -956,7 +944,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         #[cfg(not(biasedrc_no_implicit_collect_clone))]
-        collect_implicit();
+        crate::runtime::collect_implicit();
         Self::clone_no_collect(self)
     }
 }
