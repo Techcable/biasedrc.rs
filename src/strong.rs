@@ -13,7 +13,7 @@ use crate::allocator_api::alloc::{Allocator, Global};
 use crate::layout::{BrcHeader, LayoutInfo, WEAK_LOCKED_COUNT, WEAK_OVERFLOW_THRESHOLD};
 use crate::pointee::SupportedMetadata;
 use crate::ptr_meta::{self, Pointee};
-use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader};
+use crate::runtime::{DropInfo, ErasedDestructorContext, RawBrcHeader, collect_implicit};
 use crate::{
     BiasedCountError, ImpreciseRefCountError, SupportedPointee, SupportedWeakPointee, Weak,
     collect, runtime,
@@ -105,7 +105,6 @@ impl<T, A: Allocator> Brc<T, A> {
         // There is no advantage to waiting for BrcRawHeader::init to initialize the thread state.
         // This is because if the thread state is uninitialized,
         // the queue is empty and collection would be a no-op anyway.
-        #[cfg(not(biasedrc_no_implicit_collect))]
         collect();
         // This function used to be implemented as Self::new_with(|| value).
         // While correct, this caused code bloat and was noticeably slower than Arc::new.
@@ -356,8 +355,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         func: impl FnOnce(*mut T),
         alloc: A,
     ) -> Self {
-        #[cfg(not(biasedrc_no_implicit_collect))]
-        collect();
+        collect_implicit();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
         struct CleanupGuard<'a, A: Allocator> {
             ptr: NonNull<u8>,
@@ -934,8 +932,8 @@ unsafe impl<#[may_dangle] T: ?Sized + SupportedPointee, A: Allocator> Drop for B
     /// This may abort if internal state appears corrupted.
     #[inline]
     fn drop(&mut self) {
-        #[cfg(not(any(biasedrc_no_implicit_collect, biasedrc_no_implicit_collect_drop)))]
-        collect();
+        #[cfg(not(biasedrc_no_implicit_collect_drop))]
+        collect_implicit();
         // SAFETY: Drop function is executed at most once
         // and Brc cannot be used once it completes.
         unsafe {
@@ -957,8 +955,8 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     /// or if a reference count overflows.
     #[inline]
     fn clone(&self) -> Self {
-        #[cfg(not(any(biasedrc_no_implicit_collect, biasedrc_no_implicit_collect_clone)))]
-        collect();
+        #[cfg(not(biasedrc_no_implicit_collect_clone))]
+        collect_implicit();
         Self::clone_no_collect(self)
     }
 }

@@ -61,6 +61,11 @@ serde = ["dep:serde"]
 # Implement archery::SharedPointerKind
 archery = ["dep:archery"]
 
+# Disable implicit calls to `collect`, relying on manual calls instead.
+#
+# This is an advanced feature which can cause memory leaks if used incorrectly.
+implicit-collect-disable = []
+
 # Assume that OsStr and Path are #[repr(transparent)] wrappers around [u8]
 #
 # This is true in practice for all supported versions of the standard library,

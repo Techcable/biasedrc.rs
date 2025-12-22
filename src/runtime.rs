@@ -925,6 +925,19 @@ pub fn collect() {
     }
 }
 
+/// Triggers an implicit collection unless it has been disabled.
+#[inline]
+pub(crate) fn collect_implicit() {
+    if cfg!(any(
+        feature = "implicit-collect-disable",
+        biasedrc_no_implicit_collect
+    )) {
+        // do nothing
+    } else {
+        collect();
+    }
+}
+
 /// Forcibly perform the [`collect`] operation, regardless of internal heuristics.
 ///
 /// # Panics
