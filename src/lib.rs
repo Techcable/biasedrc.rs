@@ -4,6 +4,40 @@
 //!
 //! [biased reference counting]: https://dl.acm.org/doi/pdf/10.1145/3243176.3243195
 //!
+//! # Tradeoffs
+//! Like many low-level optimizations, biased reference counting has tradeoffs.
+//!
+//! The most significant advantage is performance.
+//! On the biased thread, [`Brc::clone`] and [`Brc::drop`] are 2-3x faster than the equivalent operations on [`Arc`],
+//! nearing the performance of [`Rc`].
+//! Except for the final drop operation, clones and drops are the same speed as [`Arc`] on non-biased threads.
+//!
+//! Unfortunately, there are some performance downsides too:
+//! Allocating a [`Brc`] is currently 20%-100% slower than allocating an [`Arc`],
+//! and dropping the last reference is about 20% slower than with [`Arc`].
+//! The costs are paid once per object, so the performance difference
+//! is amortized away after just 1-3 biased clone/drop operations.
+//!
+//! Other major downsides of using biasedrc include the need to maintain a thread-local queue
+//! and in some cases delayed memory reclamation.
+//!
+//! [`Rc`]: std::rc::Rc
+//!
+//! # Panics & Unwinding
+//! This library aims to unwind only when an equivalent method on [`Arc`] would unwind.
+//!
+//! I say unwind here rather than panic, because the library needs to deal with deferred destructors panicking
+//! during implicit collections.
+//! If a a panic happens during an implicit collection, it will abort the program.
+//! This is because unwinding from `Brc::<u32>::clone` or `Brc::<u32>::drop` would be highly unexpected,
+//! and make transitioning from [`Arc`] to [`Brc`] much more difficult.
+//! Unwinding from deferred destructors makes local reasoning about program behavior impossible,
+//! which is one of the main reasons Dijkstra criticised goto.
+//!
+//! If unwinding panics during implicit collections are truly desired behavior,
+//! they can be emulated by creating a newtype wrapper for a [`Brc`]
+//! which calls [`collect`] instead of [`collect_nounwind`].
+//!
 //! # Prior Art
 //! - [trc](https://github.com/EricLBuehler/trc) - Requires explicit choice of either `SharedTrc` or `Trc`,
 //!   avoiding need for runtime checks but preventing use as a drop-in replacement for `Arc`
