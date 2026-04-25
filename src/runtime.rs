@@ -688,7 +688,7 @@ pub trait DropInfo: Copy {
 /// An erased version of [`DropInfo`].
 ///
 /// This is similar to a `dyn DropTypeInfo` but is owned, sized,
-/// and limited to a subset of the triat's functionality.
+/// and limited to a subset of the trait's functionality.
 #[derive(Clone)]
 pub struct ErasedDropInfo {
     value_offset: isize,
