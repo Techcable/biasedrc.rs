@@ -1,7 +1,7 @@
 export RUST_BACKTRACE := "1"
 
 test: _check && check-format
-    cargo nextest run --all-features
+    cargo +nightly nextest run --all-features
     cargo +stable nextest run
 
 coverage: _check
@@ -17,7 +17,7 @@ miri *args: _check && check-format
 check: _check check-format
 
 _check:
-    cargo clippy --all-targets --all-features
+    cargo +nightly clippy --all-targets --all-features
     cargo +stable clippy --all-targets
     cargo doc --document-private-items --no-deps
 
