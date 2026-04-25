@@ -1,0 +1,192 @@
+# This file is for the main tests. clippy & rustfmt are separate workflows
+#
+# Indirectly based on the slog CI config
+on: [push, pull_request]
+name: Cargo Test
+
+env:
+  CARGO_TERM_COLOR: always
+  # has a history of occasional bugs (especially on old versions)
+  #
+  # the ci is free so we might as well use it ;)
+  CARGO_INCREMENTAL: 0
+
+
+jobs:
+  test:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # Even if one job fails we still want to see the other ones
+      matrix:
+        rust:
+          # Minimum Supported Rust Version
+          #
+          # This is hardcoded and needs to be in sync with Cargo.toml and the README
+          - 1.90
+
+          # Intermediate Releases (between MSRV and latest stable)
+          # Be careful not to add these needlessly; they hold up CI
+
+          # The most recent version of stable rust (automatically updated)
+          - stable
+          - nightly
+        # NOTE: Features to test must be specified manually. They are applied to all versions separately.
+        features:
+          - "std"
+          - "std serde"
+          - "std archery"
+        include:
+          # all nightly features together
+          - rust: nightly
+            features: "std nightly"
+          # test nightly features individually
+          - rust: nightly
+            features: "std nightly-ptr-meta"
+          - rust: nightly
+            features: "std nightly-coerce"
+          - rust: nightly
+            features: "std nightly-allocator"
+          - rust: nightly
+            features: "std nightly-ptr-layout"  # NOTE: This implies nightly-ptr-meta
+          - rust: nightly
+            features: "std nightly-may-dangle"
+          # interesting feature combos
+          - rust: nightly
+            features: "std nightly-ptr-meta nightly-coerce"
+          - rust: nightly
+            features: "std nightly-ptr-meta nightly-allocator"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Pin MSRV-compatible versions
+        if: ${{ contains(matrix.rust, '1.') }}  # ignored for non-pinned versions
+        env:
+          # this option is where the magic happens
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: |
+          rm -f Cargo.lock
+          cargo +stable update
+      - name: Test
+        # NOTE: Running --all-targets actually excludes doc tests. See rust-lang/cargo#6669
+        run: |
+          cargo nextest run --all --verbose --no-default-features --features "${{ matrix.features }}"
+
+  miri:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        miriflags:
+          - "-Zmiri-disable-stacked-borrows"
+          - "-Zmiri-tree-borrows"
+          # It seems we now pass test under stacked borrows in addition to tree borrows.
+          # The previous problems with stacked borrows were soely due to header arithmetic.
+          # We may need to disable this again in the future.
+          - ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Test
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-env-forward=RUST_BACKTRACE ${{ matrix.miriflags }}"
+        run: |
+          cargo miri nextest run --verbose --all-features
+
+  clippy:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          # in hardcoded versions, warnings will fail the build
+          - 1.95
+          # in auto-updated versions, warnings will not fail the build
+          - stable
+          - nightly
+        features:
+          - "std"
+        include:
+          # all nightly features together
+          - rust: nightly
+            features: "std nightly"
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - name: Clippy
+        run: |
+          cargo clippy --all --all-targets --verbose --no-default-features --features "${{ matrix.features }}" -- -D warnings
+        # When using hardcoded/pinned versions, warnings are forbidden.
+        #
+        # On automatically updated versions of rust (both stable & nightly) we allow clippy to fail.
+        # This is because automatic updates can introduce new lints or change existing lints.
+        continue-on-error: ${{ !contains(matrix.rust, '1.') }}
+
+  docs:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - nightly
+          - stable
+        features:
+          - "std"
+        include:
+          # all nightly features together
+          - rust: nightly
+            features: "std nightly"
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Docs
+        run: |
+          cargo doc --verbose --no-default-features --features "${{ matrix.features }}"
+  cargo-rdme:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-rdme
+      - name: Run cargo-rdme
+        run: |
+          cargo rdme --check
