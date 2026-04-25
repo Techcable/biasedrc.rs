@@ -89,7 +89,7 @@ boxcar = "0.2"
 crossbeam-queue = "0.3"
 
 # Polyfills for nightly features
-allocator-api2 = "0.3"
+allocator-api2 = "0.4"
 ptr-meta-stable = { package = "ptr_meta", version = "0.3", default-features = false }
 unsize = "1.1"
 
