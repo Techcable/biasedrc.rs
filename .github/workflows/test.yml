@@ -1,6 +1,7 @@
 # Unified workflow for all lints & tests.
 #
 # Indirectly based on the slog CI config.
+# All merged into one file so we can use `allgood` workaround for Gihtub Actions.
 on: [push, pull_request]
 name: CI
 
@@ -213,3 +214,17 @@ jobs:
       - shell: bash
         run: |
           cargo fmt --all -- --check
+  # Workaround for Github status checks to require that all tests pass
+  # Discussion: https://github.com/orgs/community/discussions/26733
+  # App: https://github.com/marketplace/actions/alls-green
+  allgood:
+    if: always()
+    needs: [test,miri,clippy,docs,cargo-rdme,typos,rustfmt]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@release/v1
+        with:
+          # allowed-failures: docs, linters
+          # allowed-skips: non-voting-flaky-job
+          jobs: ${{ toJSON(needs) }}
