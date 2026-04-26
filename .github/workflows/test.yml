@@ -1,11 +1,12 @@
-# This file is for the main tests. clippy & rustfmt are separate workflows
+# Unified workflow for all lints & tests.
 #
-# Indirectly based on the slog CI config
+# Indirectly based on the slog CI config.
 on: [push, pull_request]
-name: Cargo Test
+name: CI
 
 env:
   CARGO_TERM_COLOR: always
+  CLICOLOR: 1
   # has a history of occasional bugs (especially on old versions)
   #
   # the ci is free so we might as well use it ;)
@@ -190,3 +191,25 @@ jobs:
       - name: Run cargo-rdme
         run: |
           cargo rdme --check
+  typos:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run typos (pinned version)
+        uses: crate-ci/typos@v1.45.1
+  rustfmt:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - shell: bash
+        run: |
+          cargo fmt --all -- --check
