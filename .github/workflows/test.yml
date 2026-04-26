@@ -176,22 +176,22 @@ jobs:
       - name: Docs
         run: |
           cargo doc --verbose --no-default-features --features "${{ matrix.features }}"
-  cargo-rdme:
+  cargo-reedme:
     # Only run on PRs if the source branch is on someone else's repo
     if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
 
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly  # cargo-reedme requires nightly
         with:
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/cache-cargo-install-action@v3  # not supported by regular install action
         with:
-          tool: cargo-rdme
-      - name: Run cargo-rdme
+          tool: cargo-reedme
+      - name: Run cargo-reedme
         run: |
-          cargo rdme --check
+          cargo reedme --check
   typos:
     # Only run on PRs if the source branch is on someone else's repo
     if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
@@ -219,7 +219,7 @@ jobs:
   # App: https://github.com/marketplace/actions/alls-green
   allgood:
     if: always()
-    needs: [test,miri,clippy,docs,cargo-rdme,typos,rustfmt]
+    needs: [test,miri,clippy,docs,cargo-reedme,typos,rustfmt]
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether the needed jobs succeeded or failed
