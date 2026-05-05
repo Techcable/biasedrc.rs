@@ -214,6 +214,19 @@ jobs:
       - shell: bash
         run: |
           cargo fmt --all -- --check
+  cargo-sort:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-sort
+      - run: |
+          cargo sort --grouped --workspace --check .
   # Workaround for Github status checks to require that all tests pass
   # Discussion: https://github.com/orgs/community/discussions/26733
   # App: https://github.com/marketplace/actions/alls-green
