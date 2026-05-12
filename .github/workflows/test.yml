@@ -200,7 +200,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Run typos (pinned version)
-        uses: crate-ci/typos@v1.45.1
+        uses: crate-ci/typos@v1.46.0
   rustfmt:
     # Only run on PRs if the source branch is on someone else's repo
     if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}

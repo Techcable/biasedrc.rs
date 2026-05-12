@@ -34,4 +34,4 @@ check-format: && spellcheck
 
 spellcheck:
     @# use pinned version to avoid breaking build
-    uvx typos@1.40
+    uvx typos@1.46
