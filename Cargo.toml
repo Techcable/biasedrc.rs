@@ -111,96 +111,27 @@ serde = { package = "serde_core", version = "1", optional = true, default-featur
 stable_deref_trait = "1.2"
 
 [dev-dependencies]
-criterion = "0.8"
 crossbeam-channel = "0.5"
-imbl = "6.1"
-rand = { version = "0.9", features = ["small_rng"] }
-rpds = "1.2"
-triomphe = "0.1"
 
-[[bench]]
-name = "basic"
-harness = false
-
-[[bench]]
-path = "benches/rpds/rpds_hash_trie_map.rs"
-name = "rpds_hash_trie_map"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_hash_trie_map_brc.rs"
-name = "rpds_hash_trie_map_brc"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_hash_trie_map_sync.rs"
-name = "rpds_hash_trie_map_sync"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_list.rs"
-name = "rpds_list"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_list_brc.rs"
-name = "rpds_list_brc"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_list_sync.rs"
-name = "rpds_list_sync"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_vector.rs"
-name = "rpds_vector"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_vector_brc.rs"
-name = "rpds_vector_brc"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-path = "benches/rpds/rpds_vector_sync.rs"
-name = "rpds_vector_sync"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-name = "persistent_hashmap"
-path = "benches/imbl/persistent_hashmap.rs"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-name = "persistent_ordmap"
-path = "benches/imbl/persistent_ordmap.rs"
-harness = false
-required-features = ["archery"]
-
-[[bench]]
-name = "persistent_vector"
-path = "benches/imbl/persistent_vector.rs"
-harness = false
-required-features = ["archery"]
+[lints]
+workspace = true
 
 [profile.bench]
 debug = true
 
-[lints.rust]
+[workspace]
+resolver = "3"
+members = [".", "benchmark"]
+# most people aren't interested in building benchmarks, only compile & test
+# Justfile and CI always checks the whole workspace
+default-members = ["."]
+
+[workspace.lints.rust]
 unsafe-op-in-unsafe-fn = "deny"
 
-[lints.rust.unexpected_cfgs]
+[workspace.lints.rust.unexpected_cfgs]
+# t would be nice to confide this to the main package, as benchmarks doesn't use this
+# Unfortunately, this is not currently possible due to cargo limitations.
 level = "warn"
 check-cfg = [
     'cfg(biasedrc_no_implicit_collect)',
@@ -208,7 +139,7 @@ check-cfg = [
     'cfg(biasedrc_no_implicit_collect_drop)',
 ]
 
-[lints.clippy]
+[workspace.lints.clippy]
 ## groups ##
 cargo = { priority = -1, level = "warn" }
 pedantic = { level = "warn", priority = -1 }

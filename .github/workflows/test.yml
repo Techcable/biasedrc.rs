@@ -79,8 +79,9 @@ jobs:
           cargo +stable update
       - name: Test
         # NOTE: Running --all-targets actually excludes doc tests. See rust-lang/cargo#6669
+        # The `--all` flag is equivalent to `--workspace`
         run: |
-          cargo nextest run --all --verbose --no-default-features --features "${{ matrix.features }}"
+          cargo nextest run --workspace --verbose --no-default-features --features "${{ matrix.features }}"
 
   miri:
     # Only run on PRs if the source branch is on someone else's repo
@@ -110,7 +111,7 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-env-forward=RUST_BACKTRACE ${{ matrix.miriflags }}"
         run: |
-          cargo miri nextest run --verbose --all-features
+          cargo miri nextest run --workspace --verbose --all-features
 
   clippy:
     # Only run on PRs if the source branch is on someone else's repo
@@ -140,8 +141,9 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy
       - name: Clippy
+        # The `--all` flag is equivalent to `--workspace`
         run: |
-          cargo clippy --all --all-targets --verbose --no-default-features --features "${{ matrix.features }}" -- -D warnings
+          cargo clippy --workspace --all-targets --verbose --no-default-features --features "${{ matrix.features }}" -- -D warnings
         # When using hardcoded/pinned versions, warnings are forbidden.
         #
         # On automatically updated versions of rust (both stable & nightly) we allow clippy to fail.
@@ -175,7 +177,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - name: Docs
         run: |
-          cargo doc --verbose --no-default-features --features "${{ matrix.features }}"
+          cargo doc --workspace --verbose --no-default-features --features "${{ matrix.features }}"
   cargo-reedme:
     # Only run on PRs if the source branch is on someone else's repo
     if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
@@ -190,6 +192,7 @@ jobs:
         with:
           tool: cargo-reedme
       - name: Run cargo-reedme
+        # Intentionally run without `--workspace`
         run: |
           cargo reedme --check
   typos:
@@ -212,6 +215,7 @@ jobs:
         with:
           components: rustfmt
       - shell: bash
+        # While `--all` is normally an alias for `--workspace`, `cargo fmt` doesn't accept the latter
         run: |
           cargo fmt --all -- --check
   cargo-sort:

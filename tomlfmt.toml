@@ -1,0 +1,18 @@
+# Configuration file for `cargo-sort` (name is misleading)
+# Needs to be adjusted from the default since root Carg.toml defines both workspace & package
+table_order = [
+    "package",
+    "lib",
+    "bin",
+    "features",
+    "dependencies",
+    "build-dependencies",
+    "dev-dependencies",
+    # should come before workspace config (not specified by default)
+    "lints",
+    "profile",
+    # workspace comes last, to minimize diff between `[workspace.lints]` and `[lints]`
+    # ideally we would restrict to [workspace.lint] and keep workspace at its usual location,
+    # but that is not supported due to DevinR528/cargo-sort/issues/111
+    "workspace",
+]

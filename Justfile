@@ -14,12 +14,15 @@ export MIRIFLAGS := "-Zmiri-strict-provenance -Zmiri-env-forward=RUST_BACKTRACE"
 miri *args: _check && check-format
     cargo +nightly miri nextest run --all-features {{args}}
 
+bench *args: _check
+    cargo +nightly bench -p benchmark-biasedrc {{args}}
+
 check: _check check-format
 
 _check:
-    cargo +nightly clippy --all-targets --all-features
-    cargo +stable clippy --all-targets
-    cargo doc --document-private-items --no-deps
+    cargo +nightly clippy --workspace --all-targets --all-features
+    cargo +stable clippy --workspace --all-targets
+    cargo doc --workspace --document-private-items --no-deps
 
 format: && spellcheck
     cargo fmt --all
