@@ -248,18 +248,18 @@ impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Weak<T, A> {
     }
 }
 drop_may_dangle! {
-// SAFETY: We respect the may_dangle requirements
-unsafe impl<#[may_dangle] T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(this) = self.real() {
-            // SAFETY: Our existence implies we own a weak reference
-            unsafe {
-                BrcHeader::drop_weak(this.header_ptr().as_ptr(), this.layout_info());
+    // SAFETY: We respect the may_dangle requirements
+    unsafe impl<#[may_dangle] T: ?Sized + SupportedWeakPointee, A: Allocator> Drop for Weak<T, A> {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(this) = self.real() {
+                // SAFETY: Our existence implies we own a weak reference
+                unsafe {
+                    BrcHeader::drop_weak(this.header_ptr().as_ptr(), this.layout_info());
+                }
             }
         }
     }
-}
 }
 impl<T: ?Sized + SupportedWeakPointee, A: Allocator> Clone for Weak<T, A> {
     #[inline]

@@ -907,33 +907,33 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
 }
 
 drop_may_dangle! {
-// SAFETY: We respect the #[may_dangle] requirements
-unsafe impl<#[may_dangle] T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
-    /// Drops a reference to the underlying object,
-    /// potentially freeing it if there are otherwise no references.
-    ///
-    /// This implicitly calls [`collect`] to help cleanup garbage from other threads.
-    /// Use [`Self::drop_no_collect`] to avoid this.
-    ///
-    /// Due to the nature of biased reference counting,
-    /// there are some cases where destruction may be deferred.
-    ///
-    /// # Panics
-    /// This may panic if the underlying destructor panics,
-    /// or if [`collect`] panics while executing a deferred destructor.
-    ///
-    /// This may abort if internal state appears corrupted.
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(not(biasedrc_no_implicit_collect_drop))]
-        crate::runtime::collect_implicit();
-        // SAFETY: Drop function is executed at most once
-        // and Brc cannot be used once it completes.
-        unsafe {
-            Self::drop_no_collect_in_place(self);
+    // SAFETY: We respect the #[may_dangle] requirements
+    unsafe impl<#[may_dangle] T: ?Sized + SupportedPointee, A: Allocator> Drop for Brc<T, A> {
+        /// Drops a reference to the underlying object,
+        /// potentially freeing it if there are otherwise no references.
+        ///
+        /// This implicitly calls [`collect`] to help cleanup garbage from other threads.
+        /// Use [`Self::drop_no_collect`] to avoid this.
+        ///
+        /// Due to the nature of biased reference counting,
+        /// there are some cases where destruction may be deferred.
+        ///
+        /// # Panics
+        /// This may panic if the underlying destructor panics,
+        /// or if [`collect`] panics while executing a deferred destructor.
+        ///
+        /// This may abort if internal state appears corrupted.
+        #[inline]
+        fn drop(&mut self) {
+            #[cfg(not(biasedrc_no_implicit_collect_drop))]
+            crate::runtime::collect_implicit();
+            // SAFETY: Drop function is executed at most once
+            // and Brc cannot be used once it completes.
+            unsafe {
+                Self::drop_no_collect_in_place(self);
+            }
         }
     }
-}
 }
 impl<T: ?Sized + SupportedPointee, A: Allocator> Clone for Brc<T, A> {
     /// Create a new reference to the underlying object.
