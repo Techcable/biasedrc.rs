@@ -25,6 +25,7 @@ use crate::{
 #[allow(clippy::disallowed_types)]
 const _USED_IN_DOCS: () = {
     let _ = Arc::<u32>::new;
+    let _ = collect;
 };
 
 mod conversions;
@@ -110,8 +111,6 @@ impl<T, A: Allocator> Brc<T, A> {
     /// or if any method on the allocator panics.
     #[inline]
     pub fn new_in(value: T, alloc: A) -> Self {
-        #[cfg(not(biasedrc_no_implicit_collect))]
-        collect();
         // This function used to be implemented as Self::new_with(|| value).
         // While correct, this caused code bloat and was noticeably slower than Arc::new.
         //
@@ -348,6 +347,7 @@ impl<T: ?Sized + SupportedPointee, A: Allocator> Brc<T, A> {
         //
         // However, there may be a performance advantage to merging the checks together.
         // At some point, we should investigate and benchmark the effect of that change.
+        #[cfg(not(biasedrc_no_implicit_collect))]
         collect_implicit();
         let layout = LayoutInfo::<A>::new_or_panic(layout);
         struct CleanupGuard<'a, A: Allocator> {
