@@ -1,3 +1,11 @@
 disallowed-types = [
     { path = "alloc::sync::Arc", reason = "probably a typo", replacement = "Brc" },
+    # prefer portable-atomic
+    { path = "core::sync::atomic::AtomicBool", replacement = "portable_atomic::AtomicBool" },
+    { path = "core::sync::atomic::AtomicU32", replacement = "portable_atomic::AtomicU32" },
+    { path = "core::sync::atomic::AtomicU64", replacement = "portable_atomic::AtomicU64" },
+    { path = "core::sync::atomic::AtomicI64", replacement = "portable_atomic::AtomicI64" },
+    { path = "core::sync::atomic::AtomicI32", replacement = "portable_atomic::AtomicI32" },
+    { path = "core::sync::atomic::AtomicUsize", replacement = "portable_atomic::AtomicUsize" },
+    { path = "core::sync::atomic::AtomicPtr", replacement = "portable_atomic::AtomicPtr" },
 ]

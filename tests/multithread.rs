@@ -1,7 +1,9 @@
 //! Tests the interactions between multiple threads.
 use biasedrc::Brc;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
+
+use portable_atomic::AtomicU32;
 
 struct DropCounter<'a>(&'a AtomicU32);
 impl Drop for DropCounter<'_> {

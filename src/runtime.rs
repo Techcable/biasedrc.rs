@@ -7,9 +7,8 @@ use core::ffi::c_void;
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomPinned;
 use core::ptr::NonNull;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use portable_atomic::{AtomicU32, AtomicUsize};
 
 mod threads;
 

@@ -7,7 +7,8 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
+use portable_atomic::AtomicU32;
 
 const _USED_IN_DOCS: () = {
     let _ = Brc::<u32>::new;

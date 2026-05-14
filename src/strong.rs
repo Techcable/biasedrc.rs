@@ -6,7 +6,9 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
+
+use portable_atomic::AtomicU32;
 use stable_deref_trait::CloneStableDeref;
 
 use crate::allocator_api::alloc::{Allocator, Global};

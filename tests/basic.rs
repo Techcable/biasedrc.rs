@@ -1,9 +1,10 @@
 //! Basic smoke tests.
 
 use biasedrc::{Brc, Weak};
+use portable_atomic::AtomicU32;
 use std::error::Error;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use unsize::{CoerceUnsize, CoerciblePtr};
 
 /// Tests that allocation works, without testing [`Clone`].

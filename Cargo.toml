@@ -90,6 +90,7 @@ unsafe-assume-cstr-layout = []
 atomic = "0.6"
 boxcar = "0.2"
 crossbeam-queue = "0.3"
+portable-atomic = { version = "1", default-features = false, features = ["std", "require-cas"] }
 
 # Polyfills for nightly features
 allocator-api2 = "0.4"
