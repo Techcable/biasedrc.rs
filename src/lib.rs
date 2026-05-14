@@ -68,7 +68,7 @@ pub(crate) use core::ptr as ptr_meta;
 #[cfg(not(feature = "nightly-ptr-meta"))]
 pub(crate) use ptr_meta_stable as ptr_meta;
 
-#[allow(unused_imports, clippy::disallowed_types, reason = "used for docs")]
+#[allow(clippy::disallowed_types, reason = "used for docs")]
 use alloc::sync::Arc;
 
 #[macro_use]
@@ -88,3 +88,8 @@ pub use crate::strong::Brc;
 #[allow(unused_imports, reason = "may be nop if no features are enabled")]
 pub use crate::third_party::*;
 pub use crate::weak::Weak;
+
+#[allow(clippy::disallowed_types)]
+const _USED_IN_DOCS: () = {
+    let _ = Arc::<u32>::new;
+};

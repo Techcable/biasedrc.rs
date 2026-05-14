@@ -1,6 +1,5 @@
 //! Defines the underlying layout of the [`crate::Brc`] type in-memory.
 
-#[allow(unused_imports, reason = "used for docs")]
 use crate::Brc;
 use crate::allocator_api::alloc::Allocator;
 use crate::runtime::RawBrcHeader;
@@ -9,6 +8,10 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+const _USED_IN_DOCS: () = {
+    let _ = Brc::<u32>::new;
+};
 
 /// If the weak reference count has
 pub const WEAK_LOCKED_COUNT: u32 = u32::MAX;

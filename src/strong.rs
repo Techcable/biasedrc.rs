@@ -1,4 +1,4 @@
-#[allow(clippy::disallowed_types, unused_imports, reason = "used for docs")]
+#[allow(clippy::disallowed_types, reason = "used for docs")]
 use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::marker::PhantomData;
@@ -20,6 +20,11 @@ use crate::runtime::{
 use crate::{
     BiasedCountError, ImpreciseRefCountError, SupportedPointee, SupportedWeakPointee, Weak,
     collect, runtime,
+};
+
+#[allow(clippy::disallowed_types)]
+const _USED_IN_DOCS: () = {
+    let _ = Arc::<u32>::new;
 };
 
 mod conversions;
