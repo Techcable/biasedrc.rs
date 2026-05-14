@@ -1,0 +1,4 @@
+# right now, this is only used for formatting configuration
+line-length = 120
+# keep in .cache subdir to avoid bloating `ls -A`
+cache-dir = ".cache/ruff"

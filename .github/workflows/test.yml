@@ -231,12 +231,26 @@ jobs:
           tool: cargo-sort
       - run: |
           cargo sort --grouped --workspace --check .
+  pyfmt:
+    # Only run on PRs if the source branch is on someone else's repo
+    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check --diff"
+      - uses: astral-sh/ruff-action@v3
+        name: isort with ruff
+        with:
+          args: "check --select=I --diff"
   # Workaround for Github status checks to require that all tests pass
   # Discussion: https://github.com/orgs/community/discussions/26733
   # App: https://github.com/marketplace/actions/alls-green
   allgood:
     if: always()
-    needs: [test,miri,clippy,docs,cargo-reedme,typos,rustfmt]
+    needs: [test,miri,clippy,docs,cargo-reedme,typos,rustfmt,pyfmt]
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether the needed jobs succeeded or failed
