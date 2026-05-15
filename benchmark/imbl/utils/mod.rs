@@ -2,7 +2,7 @@
 
 use rand::distr::{Distribution, StandardUniform};
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::hash::Hash;

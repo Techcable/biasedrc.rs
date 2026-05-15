@@ -10,9 +10,9 @@ biasedrc = { path = "..", features = ["archery"] }
 
 [dev-dependencies]
 criterion = "0.8"
-imbl = "6.1"
+imbl = "7"
 paste3 = "1"
-rand = { version = "0.9", features = ["small_rng"] }
+rand = "0.10"
 rpds = "1.2"
 triomphe = "0.1"
 
