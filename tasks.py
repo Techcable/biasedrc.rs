@@ -46,7 +46,7 @@ def miri(ctx):
 def bench(ctx, basic=False):
     args = shlex.split(ctx.remainder)
     if basic:
-        args.append("--bench=basic")
+        args.insert(0, "--bench=basic")
     ctx.run(shlex.join([*shlex.split("cargo +nightly bench -p benchmark-biasedrc --all-features"), *args]), pty=True)
 
 
