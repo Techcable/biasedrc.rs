@@ -250,7 +250,7 @@ jobs:
   # App: https://github.com/marketplace/actions/alls-green
   allgood:
     if: always()
-    needs: [test,miri,clippy,docs,cargo-reedme,typos,rustfmt,pyfmt]
+    needs: [test,miri,clippy,docs,cargo-reedme,typos,rustfmt,cargo-sort,pyfmt]
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether the needed jobs succeeded or failed
